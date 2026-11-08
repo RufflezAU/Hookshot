@@ -53,7 +53,9 @@ HOS_CONFIG=stable ./hookshot-play.sh
   build. `RX_VK_KEEP_FINALIZED_MB=0` (config `keepoff`) did not change it. Open: is it main's
   storage-buffer/finalized-texture path, or the program-cache load (5.4 GB), or our eviction?
 - **The older base** (udmabuf branch + giveback, before this rebase) ran the forest at 10–12 fps
-  with no crash but with lighting/texture flicker. It is not in this branch.
+  with no crash but with lighting/texture flicker. It is kept as branch `deck/legacy`; build it the
+  same way, with the same `deck/` settings (its `deck/` folder predates `configs/`, so copy
+  `hookshot_env.txt` from this branch's `configs/stable.env`).
 
 ## Measure it the same way
 
