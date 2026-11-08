@@ -56,7 +56,8 @@ HOS_CONFIG=stable ./hookshot-play.sh    # or fps, or keepoff
 ```
 
 `STATE.md` is the current known-good/known-bad state and the exact build/run steps; `configs/`
-lists every measured setting. Read `STATE.md` before changing anything.
+lists every measured setting; `BENCHMARKS.md` has the measured fps/GPU/VRAM per build and config,
+with the raw `ab_harness.py` JSON in `benchmarks/`. Read `STATE.md` before changing anything.
 
 `/dev/udmabuf` must exist. The kernel option is `CONFIG_UDMABUF=y`; the node is usually created at
 boot. If it is missing:

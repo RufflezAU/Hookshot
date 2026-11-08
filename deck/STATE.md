@@ -59,6 +59,9 @@ HOS_CONFIG=stable ./hookshot-play.sh
 
 ## Measure it the same way
 
+The results table lives in `BENCHMARKS.md` (`benchmarks/*.json` are the raw runs). Add a row and the
+JSON whenever a build or config changes, so the next person can choose on evidence.
+
 `test/ab_harness.py` runs a build headless, steers it into the save with `HOS_INPUT_LIVE`, walks,
 and records VRAM/textures/GPU/fps/faults per run:
 

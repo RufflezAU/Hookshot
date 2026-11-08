@@ -1,0 +1,27 @@
+{
+  "name": "b1200_t128_e1500_r3",
+  "env": {
+    "RX_VK_VRAM_MB": "1200"
+  },
+  "seconds": 240,
+  "max_draws": 2560,
+  "world_at": 55.2,
+  "peak_tex": 2904,
+  "peak_budget": 1200,
+  "peak_vram_used": 6227,
+  "peak_vram_allowed": 6144,
+  "max_gpu_ms": 68.4,
+  "max_submit_ms": 109.79,
+  "last_fps": 13.3,
+  "imports_given_mb": 1216,
+  "oom": 0,
+  "device_lost": 0,
+  "failed_submit": 0,
+  "mem_kill": 0,
+  "rss_kill": 0,
+  "ended_at": 241.3,
+  "exited_early": false,
+  "exit_at": null,
+  "frames_made_max": 12.3,
+  "log_lines": 2456
+}

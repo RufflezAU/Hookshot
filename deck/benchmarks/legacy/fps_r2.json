@@ -1,0 +1,27 @@
+{
+  "name": "b1500_t128_e800_r2",
+  "env": {
+    "RX_VK_EVICT_MIN_MS": "800"
+  },
+  "seconds": 240,
+  "max_draws": 2565,
+  "world_at": 57.8,
+  "peak_tex": 2862,
+  "peak_budget": 1500,
+  "peak_vram_used": 6227,
+  "peak_vram_allowed": 6144,
+  "max_gpu_ms": 54.6,
+  "max_submit_ms": 91.49,
+  "last_fps": 13.0,
+  "imports_given_mb": 1008,
+  "oom": 0,
+  "device_lost": 0,
+  "failed_submit": 0,
+  "mem_kill": 0,
+  "rss_kill": 0,
+  "ended_at": 241.3,
+  "exited_early": false,
+  "exit_at": null,
+  "frames_made_max": 17.2,
+  "log_lines": 2493
+}

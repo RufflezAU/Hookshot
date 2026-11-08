@@ -1,0 +1,27 @@
+{
+  "name": "b1500_t256_e1500_r2",
+  "env": {
+    "RX_VK_TEX_MAX_MB": "256"
+  },
+  "seconds": 240,
+  "max_draws": 2759,
+  "world_at": 59.5,
+  "peak_tex": 3125,
+  "peak_budget": 1500,
+  "peak_vram_used": 6355,
+  "peak_vram_allowed": 6144,
+  "max_gpu_ms": 52.4,
+  "max_submit_ms": 107.32,
+  "last_fps": 12.8,
+  "imports_given_mb": 928,
+  "oom": 0,
+  "device_lost": 0,
+  "failed_submit": 0,
+  "mem_kill": 0,
+  "rss_kill": 0,
+  "ended_at": 241.5,
+  "exited_early": false,
+  "exit_at": null,
+  "frames_made_max": 15.2,
+  "log_lines": 2491
+}

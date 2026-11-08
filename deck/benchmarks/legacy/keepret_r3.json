@@ -1,0 +1,27 @@
+{
+  "name": "b1500_t128_e1500_keepret_r3",
+  "env": {
+    "RX_VK_KEEP_RETIRED": "1"
+  },
+  "seconds": 240,
+  "max_draws": 2620,
+  "world_at": 52.9,
+  "peak_tex": 2892,
+  "peak_budget": 1500,
+  "peak_vram_used": 6227,
+  "peak_vram_allowed": 6144,
+  "max_gpu_ms": 60.1,
+  "max_submit_ms": 87.38,
+  "last_fps": 10.8,
+  "imports_given_mb": 0,
+  "oom": 0,
+  "device_lost": 0,
+  "failed_submit": 0,
+  "mem_kill": 0,
+  "rss_kill": 0,
+  "ended_at": 159.7,
+  "exited_early": true,
+  "exit_at": 158.7,
+  "frames_made_max": 13.6,
+  "log_lines": 1941
+}
