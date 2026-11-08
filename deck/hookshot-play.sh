@@ -1,19 +1,20 @@
 #!/bin/sh
 # Runs Hookshot from the folder this script is in, with the Deck's udmabuf path.
 #
-#   ./hookshot-play.sh                     the settings in hookshot_env.txt
-#   HOS_CONFIG=stable ./hookshot-play.sh   the settings in configs/stable.env (copied over first)
-#   HOS_CONFIG=fps ./hookshot-play.sh      configs/fps.env
+#   ./hookshot-play.sh              the "stable" config
+#   ./hookshot-play.sh low          configs/low.env + configs/low.ini
+#   HOS_CONFIG=fps ./hookshot-play.sh
+#   Steam LaunchOptions "low" does the same as the argument.
 #
 cd "$(dirname "$0")" || exit 1
-if [ -n "$HOS_CONFIG" ]; then
-    if [ -f "configs/$HOS_CONFIG.env" ]; then
-        cp "configs/$HOS_CONFIG.env" hookshot_env.txt
-    else
-        echo "hookshot: no configs/$HOS_CONFIG.env (have: $(ls configs/*.env 2>/dev/null | sed 's#configs/##;s#\.env##' | tr '\n' ' '))" >&2
-        exit 1
-    fi
+CFG=${1:-${HOS_CONFIG:-stable}}
+if [ -f "configs/$CFG.env" ]; then
+    cp "configs/$CFG.env" hookshot_env.txt
+else
+    echo "hookshot: no configs/$CFG.env (have: $(ls configs/*.env 2>/dev/null | sed 's#configs/##;s#\.env##' | tr '\n' ' '))" >&2
+    exit 1
 fi
+[ -f "configs/$CFG.ini" ] && cp "configs/$CFG.ini" hookshot_options.ini
 # The game turns the memfd path on by itself when /sys/module/udmabuf/parameters/size_limit_mb is
 # readable. Force it where sysfs is hidden (a Flatpak sandbox) but only if /dev/udmabuf is really
 # there: a forced memfd without a working udmabuf has no import at all.
