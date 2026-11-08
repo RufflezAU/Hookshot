@@ -8,6 +8,7 @@
 #
 cd "$(dirname "$0")" || exit 1
 CFG=${1:-${HOS_CONFIG:-stable}}
+[ $# -gt 0 ] && shift   # the config name is ours, not the game's
 if [ -f "configs/$CFG.env" ]; then
     cp "configs/$CFG.env" hookshot_env.txt
 else
