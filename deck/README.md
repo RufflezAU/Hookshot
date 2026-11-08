@@ -47,8 +47,16 @@ The first build translates the game (20–70 minutes on a Deck); later builds re
 
 ## Run
 
-Copy `deck/hookshot-play.sh`, `deck/hookshot_env.txt` and `deck/hookshot_options.ini` next to the
-built `hookshot` binary, then run the script (or point a non-Steam shortcut at it).
+Copy `deck/hookshot-play.sh`, `deck/hookshot_env.txt`, `deck/hookshot_options.ini` and
+`deck/configs/` next to the built `hookshot` binary, then run the script (or point a non-Steam
+shortcut at it):
+
+```sh
+HOS_CONFIG=stable ./hookshot-play.sh    # or fps, or keepoff
+```
+
+`STATE.md` is the current known-good/known-bad state and the exact build/run steps; `configs/`
+lists every measured setting. Read `STATE.md` before changing anything.
 
 `/dev/udmabuf` must exist. The kernel option is `CONFIG_UDMABUF=y`; the node is usually created at
 boot. If it is missing:
