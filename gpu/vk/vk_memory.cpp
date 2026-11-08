@@ -2050,7 +2050,7 @@ std::deque<DeadMirror> dead_mirrors;
 // Forest ~1.3 GB of imports, 15-45 ms a submission (3-4 fps on an RX 7800 XT with 11 ms of GPU time; issues 312, 413). Its
 // table entries went at its retirement, and its mirror goes before (mstate), so once the GPU is past retired_value nothing
 // reaches it. The node stays (pointers to it are kept elsewhere); only its buffer and memory go. RX_VK_KEEP_RETIRED=1: kept
-struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; uint64_t value; uint64_t bytes; };
+struct DeadImport { VkBuffer buffer; VkDeviceMemory memory; std::vector<VkDeviceMemory> pieces; uint64_t value; uint64_t bytes; };
 std::deque<DeadImport> dead_imports;
 uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
 void reap_mirrors() {   // (pools_mu held)
@@ -2067,6 +2067,7 @@ void reap_mirrors() {   // (pools_mu held)
     while (!dead_imports.empty() && dead_imports.front().value <= mem_completed) {
         vkDestroyBuffer(dev.device, dead_imports.front().buffer, nullptr);
         vkFreeMemory(dev.device, dead_imports.front().memory, nullptr);
+        for (VkDeviceMemory m : dead_imports.front().pieces) vkFreeMemory(dev.device, m, nullptr);
         st_retired_imports_freed++, st_retired_import_bytes_freed += dead_imports.front().bytes;
         dead_imports.pop_front();
     }
@@ -2081,8 +2082,8 @@ void retired_imports_give_back() {   // (pools_mu held)
         if (!p.memory) continue;
         if (!keep && p.mstate == Pool::MIRROR_NONE && !p.inherit_pending && p.retired_value <= mem_completed &&
             p.last_value <= mem_completed) {
-            dead_imports.push_back({p.buffer, p.memory, std::max(mem_rec_value, p.last_value), p.hi - p.lo});
-            p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0;
+            dead_imports.push_back({p.buffer, p.memory, std::move(p.pieces), std::max(mem_rec_value, p.last_value), p.hi - p.lo});
+            p.buffer = VK_NULL_HANDLE, p.memory = VK_NULL_HANDLE, p.address = 0, p.pieces.clear();
             pools_gen++;
             continue;
         }

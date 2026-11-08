@@ -402,7 +402,11 @@ def main():
     if PGO == "gen":
         hot_fl = [f if f != "-O2" else "-O1" for f in hot_fl] + ["-fprofile-instr-generate", "-mllvm", "-disable-vp=true"]
     elif PGO:
-        hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO]
+        # (the profile's contents in the flags the object key hashes: its path alone stays the same across releases, so an update with a
+        # new profile kept the hot code built from the old one) - backported from upstream main (issue 565) so the Deck's
+        # existing object cache keys the hot chunks the same way
+        with open(PGO, "rb") as f:
+            hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
              hot_fl if os.path.basename(s).startswith("code_hot") else fl,
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
@@ -445,6 +449,10 @@ def main():
     vk_jobs = []
     vk_headers, spirv_headers = cpm_package("vulkanheaders"), cpm_package("spirv-headers")
     vk_prebuilt = os.environ.get("HOOKSHOT_VK_PREBUILT", "")
+    # (this Deck build: the AppImage's glibc 2.35 sysroot carries no C++ standard library headers, so gpu/vk is compiled
+    # with libstdc++-14's, unpacked from libstdc++-14-dev; -static-libstdc++ below takes its libstdc++.a)
+    CXX_INC = os.environ.get("HOOKSHOT_CXX_INCLUDE", "")
+    CXX_LIB = os.environ.get("HOOKSHOT_CXX_LIB", "")
     if a.standalone and not a.only and vk_prebuilt:
         print("the Vulkan back end: %s, as built" % vk_prebuilt)
     elif a.standalone and not a.only and vk_headers and spirv_headers:
@@ -472,7 +480,7 @@ def main():
             "-I" + os.path.join(GPU, "third_party", "suyu"),
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
-            "-I" + os.path.join(vk_headers, "include"), "-I" + vk] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
+            "-I" + os.path.join(vk_headers, "include"), "-I" + vk] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else []) +             (["-isystem", os.path.join(CXX_INC, "c++", "14"), "-isystem", os.path.join(CXX_INC, "x86_64-linux-gnu", "c++", "14")] if CXX_INC else [])
         # (Eden's recompiler and sirit see only their own headers: a change to the back end's vk_*.h does not
         # rebuild their ~500 files; the back end itself depends on everything, suyu's texture decoders included)
         vk_lib_deps = tree_headers(os.path.join(vk, "eden"), os.path.join(vk, "sirit"), os.path.join(vk, "compat"),
@@ -585,7 +593,8 @@ def main():
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + [
                 "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
-                "-static-libstdc++", "-static-libgcc", "@" + vrsp, "-ldl", "-lpthread", "-lm"]
+                "-static-libstdc++", "-static-libgcc"] + (["-L" + CXX_LIB] if CXX_LIB else []) + [
+                "@" + vrsp, "-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
                 ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else [])
