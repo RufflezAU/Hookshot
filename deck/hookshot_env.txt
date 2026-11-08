@@ -1,7 +1,8 @@
 # Steam Deck OLED, 14 GB unified. These are read by the game itself at startup (hookshot_env.txt).
-# Texture budget: 1500 MB leaves the compositor room. 2200 MB went over the driver's allowance and
-# RADV started paging VRAM to system memory.
-RX_VK_VRAM_MB=1500
+# Texture budget. 1200 MB was the only value that stayed under the driver's allowance in an
+# overnight A/B on one Deck (peak 6099 of 6144 MB); 1500 MB was +83 MB over, 2200 MB went over
+# badly and RADV paged VRAM to system memory.
+RX_VK_VRAM_MB=1200
 # Large textures: leave their top levels out above this, so the big ones are not made at all.
 RX_VK_TEX_MAX_DIM=1024
 RX_VK_TEX_MAX_MB=128

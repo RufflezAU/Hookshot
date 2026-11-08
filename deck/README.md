@@ -71,8 +71,8 @@ The launcher only forces `HOS_GUEST_MEMFD=1` when the sysfs parameter is hidden 
 `hookshot_env.txt`: the texture budget and eviction knobs. They are a starting point measured on
 one Deck; tune the budget to your own tolerance. The two that matter:
 
-- `RX_VK_VRAM_MB` — the texture budget. 1500 MB leaves the compositor room; 2200 MB was where
-  the Deck went over the driver's allowance.
+- `RX_VK_VRAM_MB` — the texture budget. 1200 MB was the only value that stayed under the
+  driver's allowance in an overnight A/B (peak 6099 of 6144 MB); 1500 MB was 83 MB over.
 - `RX_VK_EVICT_MIN_MS` — how long a texture may go unused before it can be evicted (default
   1000 ms). Lower means less VRAM and more re-uploads.
 
