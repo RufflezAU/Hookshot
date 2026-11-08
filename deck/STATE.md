@@ -58,6 +58,10 @@ HOS_CONFIG=stable ./hookshot-play.sh
   no `CRASH:` line; Steam reports exit code 0. The same save is stable on the older udmabuf-base
   build. `RX_VK_KEEP_FINALIZED_MB=0` (config `keepoff`) did not change it. Open: is it main's
   storage-buffer/finalized-texture path, or the program-cache load (5.4 GB), or our eviction?
+- **Latest main (`15ec28d`, vanilla) crashes in the RADV driver at startup** on this Deck:
+  `CRASH: exception 0xc0000005 ... at libvulkan_radeon.so+0x19cc52`, right after the mesh programs.
+  So the upstream fixes (#705, #772) cannot be used here yet; tracked in
+  <https://github.com/NotRexed/Hookshot/issues/862>.
 - **The older base** (udmabuf branch + giveback, before this rebase) ran the forest at 10–12 fps
   with no crash but with lighting/texture flicker. It is kept as branch `deck/legacy`; build it the
   same way, with the same `deck/` settings (its `deck/` folder predates `configs/`, so copy

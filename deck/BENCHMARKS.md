@@ -58,6 +58,7 @@ read from the same `hookshot_log.txt` afterwards.
 | 2026-11-09 07:55 | legacy + eviction (`fps`) | 1500/128/800 | stable, no visible difference from `stable` | 6–15 | same class |
 | 2026-11-09 09:35 | main `58af2c0` + eviction | 1200/128/1500 | looked nicer, **exited at the room door** | ~15 before | 856 draws, VRAM 3840/6027, no device lost, exit code 0 |
 | 2026-11-09 09:41 | main + eviction, `KEEP_FINALIZED_MB=0` | 1200/128/1500 | same exit at the door | — | log ends in the finalized-texture upload path |
+| 2026-11-09 10:45 | latest main `15ec28d` (vanilla) | 1200/128/1500 | **crashes in the RADV driver at startup**, headless | — | `CRASH: exception 0xc0000005 ... at libvulkan_radeon.so+0x19cc52`, right after the mesh programs |
 
 The two verdicts that only a person can give: the legacy base **does not crash** but flickers; the
 main base **looks better** but exits at the door. That is the trade-off this branch is trying to
