@@ -30,6 +30,12 @@ The two failure modes seen here, and their fixes:
   `build.py` started before the fix was in the tree).
 - `native NVN: memory pool without storage (size 0x98000000)` — `HOS_MEMORY_MB` set below the
   default. Do not set it; the game expects the full 9808 MB arrangement.
+- `'string.h' file not found` (third_party/zbic) or `'algorithm' file not found`
+  (third_party/a64-kit/lift) on a fresh checkout: those two host helpers are compiled with the
+  AppImage's clang, which cannot see the system's C/C++ headers here. Copy the prebuilt helpers from
+  a tree that built before — `third_party/zbic/zbic.so` and `third_party/a64-kit/lift/liba64emit.so`
+  plus its `.sha1` stamp (the stamp is the SHA-1 of `a64emit.cpp` + `suyu/arm64_to_c.h`, so a tree
+  with the same sources accepts it) — or build them with the system compiler.
 
 ## Run it exactly
 
