@@ -1,3 +1,9 @@
+<p align="center">
+  <b>Steam Deck OLED branch</b> — udmabuf guest memory (PR #448), retired-import giveback (PR #446)
+  and a time-based texture eviction, plus the Deck's settings and build script. See
+  <a href="deck/README.md">deck/README.md</a>.
+</p>
+
 <h1 align="center">
   <br>
   <a>
