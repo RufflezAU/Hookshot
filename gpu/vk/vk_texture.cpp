@@ -165,6 +165,14 @@ std::unordered_map<Key, std::unique_ptr<Texture>, KeyHash> textures;
 std::unordered_multimap<uint64_t, Texture*> by_gpu;
 uint64_t frame_no = 1;
 uint64_t total_bytes = 0;
+// The eviction's age in wall-clock milliseconds, not presents: on a device slow enough to run the world at 4 fps,
+// "unused for 60 presents" is 15 seconds, and VRAM ran over the driver's limit between two sweeps (the Deck: textures
+// 4.0 GB against a 1.2 GB budget, then the driver paged VRAM out and submissions took 100+ ms). At 60 fps the two
+// measures agree (60 presents = 1 s), so this changes nothing there.
+static uint64_t tex_now_ms() {
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 // (RX_VK_LOG_REMADE=1) Textures evicted and made again within 600 frames, and those of them that were then sampled
 // empty (storage the GPU rendered, not uploaded): what the eviction's minimum age below is measured by
@@ -1333,6 +1341,7 @@ void forget_gpu(Texture* tex) {
 Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw, int bh, int bpb) {
     auto tex = std::make_unique<Texture>();
     Texture& x = *tex;
+    x.last_ms = tex_now_ms();
     x.gpu = t->gpu, x.d = t->d, x.L = t->L, x.nvn_format = t->d.format;
     x.guest = host->gpu_guest(t->gpu);
     x.guest_size = t->L.size;
@@ -1723,6 +1732,7 @@ uint32_t texture_epoch() {
 
 Texture* texture_touch(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;
+    tex->last_ms = tex_now_ms();
     tex->last_value = rec_value;
     if (!for_sampling) return tex;
     // contents: from guest memory unless the GPU wrote the image (then it is the content, unless the texture was
@@ -2372,6 +2382,7 @@ void texture_written(Texture* tex) {
 
 bool texture_touch_quick(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;   // (the same values whichever thread stores them)
+    tex->last_ms = tex_now_ms();
     tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
@@ -2856,7 +2867,7 @@ void texture_frame(uint64_t completed) {
     if (no_evict || (sweep && frame_no % 600)) return;
     std::vector<std::pair<uint64_t, Texture*>> order;
     order.reserve(textures.size());
-    for (auto& kv : textures) order.push_back({kv.second->last_frame, kv.second.get()});
+    for (auto& kv : textures) order.push_back({kv.second->last_ms, kv.second.get()});
     std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     std::vector<Texture*> gone;
     // (over the budget, what goes has gone unused for RX_VK_EVICT_MIN_UNUSED frames, 60 by default; it was 8. On an
@@ -2865,8 +2876,9 @@ void texture_frame(uint64_t completed) {
     // within 10), uploaded and decoded again each time; and a 260 x 260 one the GPU renders and the game samples every
     // 40 frames came back empty each time (22 times; the lit ground black for a frame, a tiled pattern over the ground).
     // With 60: 2. The textures that are really done with still go, 52 frames later)
-    static const uint64_t min_unused =
-        getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_UNUSED"))) : 60;
+    static const uint64_t min_unused_ms =
+        getenv("RX_VK_EVICT_MIN_MS") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_MS"))) : 1000;
+    const uint64_t now_ms = tex_now_ms();
     // (hookshot) a render target another image has since been drawn over (same storage, another size or format:
     // OoT's dynamic resolution makes a new set at each size in the same pool memory) holds nothing any more: it
     // goes like any other. Kept, they were 3.6 GB of 4.5 GB rendered, VRAM near the driver's limit, and the
@@ -2918,7 +2930,7 @@ void texture_frame(uint64_t completed) {
              (unsigned long long)(finalized_kept >> 10), n ? line : "");
     }
     for (auto& [last, tex] : order) {
-        if ((!sweep && total_bytes <= budget / 8 * 7) || frame_no - last < (sweep ? std::max<uint64_t>(120, min_unused) : min_unused)) break;
+        if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, min_unused_ms) : min_unused_ms)) break;
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -2927,18 +2939,18 @@ void texture_frame(uint64_t completed) {
         // (one unused for 3600 presents (a minute) goes: a course left behind; the game draws it again when it comes
         // back to that course. Without it a course change kept 1.4 GB arrays and VRAM ran over)
         // (600 presents when the process is over what the driver allows: then the driver pages VRAM to system memory)
-        const uint64_t keep_rendered = known && used > allowed ? 600 : 3600;
+        const uint64_t keep_rendered_ms = known && used > allowed ? 10000 : 60000;
         const bool overwritten = drawn_over(tex);   // (above)
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
             if (finalized_kept <= keep_finalized_max) continue;
             finalized_kept -= tex->bytes;
             static int logged;
             if (logged++ < 100)
-                logf("vk: kept finalized textures over %llu MB: #%u %#llx %ux%u NVN %#x goes (unused for %llu frames)",
+                logf("vk: kept finalized textures over %llu MB: #%u %#llx %ux%u NVN %#x goes (unused for %llu ms)",
                      (unsigned long long)(keep_finalized_max >> 20), tex->id, (unsigned long long)tex->gpu, tex->width,
-                     tex->height, tex->nvn_format, (unsigned long long)(frame_no - last));
+                     tex->height, tex->nvn_format, (unsigned long long)(now_ms - last));
         }
-        if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && frame_no - last < keep_rendered) continue;
+        if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && now_ms - last < keep_rendered_ms) continue;
         if (sweep && !overwritten) continue;
         // (and a small one never: its texels exist nowhere else, and it is made once and kept by the game. The sky's
         // 256 x 256 lookup table, unused while a menu was up, went and came back from memory as garbage: the rainbow

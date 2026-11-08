@@ -692,6 +692,10 @@ def main():
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+        # (this Deck build: the AppImage's glibc 2.35 sysroot carries no C++ standard library headers, so gpu/vk is
+        # compiled with libstdc++-14's, unpacked from libstdc++-14-dev; -static-libstdc++ below takes its libstdc++.a)
+        CXX_INC = os.environ.get("HOOKSHOT_CXX_INCLUDE", "")
+        CXX_LIB = os.environ.get("HOOKSHOT_CXX_LIB", "")
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
@@ -707,7 +711,7 @@ def main():
             "-I" + os.path.join(GPU, "third_party", "suyu"),
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
-            "-I" + os.path.join(vk_headers, "include"), "-I" + vk] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
+            "-I" + os.path.join(vk_headers, "include"), "-I" + vk] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else []) +             (["-isystem", os.path.join(CXX_INC, "c++", "14"), "-isystem", os.path.join(CXX_INC, "x86_64-linux-gnu", "c++", "14")] if CXX_INC else [])
         # (Eden's recompiler and sirit see only their own headers: a change to the back end's vk_*.h does not
         # rebuild their ~500 files; the back end itself depends on everything, suyu's texture decoders included)
         vk_lib_deps = tree_headers(os.path.join(vk, "eden"), os.path.join(vk, "sirit"), os.path.join(vk, "compat"),
@@ -866,7 +870,7 @@ def main():
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + [
                 "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
-                "-static-libstdc++", "-static-libgcc", "@" + vrsp, "-ldl", "-lpthread", "-lm"]
+                "-static-libstdc++", "-static-libgcc"] + (["-L" + CXX_LIB] if CXX_LIB else []) + ["@" + vrsp, "-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
                 ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else [])

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Runs Hookshot from the folder this script is in, with the Deck's udmabuf path.
+cd "$(dirname "$0")" || exit 1
+# The game turns the memfd path on by itself when /sys/module/udmabuf/parameters/size_limit_mb is
+# readable. Force it where sysfs is hidden (a Flatpak sandbox) but only if /dev/udmabuf is really
+# there: a forced memfd without a working udmabuf has no import at all.
+if [ ! -r /sys/module/udmabuf/parameters/size_limit_mb ] && [ -w /dev/udmabuf ]; then
+    export HOS_GUEST_MEMFD=1
+fi
+[ -e /dev/udmabuf ] || echo "hookshot: /dev/udmabuf is missing (sudo mknod /dev/udmabuf c 10 258)" >&2
+[ -f hookshot_log.txt ] && mv -f hookshot_log.txt hookshot_log.txt.old.txt
+exec ./hookshot "$@" > hookshot_log.txt 2>&1

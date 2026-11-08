@@ -1,3 +1,8 @@
+<p align="center">
+  <b>Steam Deck OLED branch</b> — upstream main plus a millisecond texture eviction, the Deck build
+  fix and the settings measured on a Deck. See <a href="deck/README.md">deck/README.md</a>.
+</p>
+
 <h1 align="center">
   <br>
   <a>
