@@ -66,7 +66,8 @@ The launcher only forces `HOS_GUEST_MEMFD=1` when the sysfs parameter is hidden 
 
 ## Settings on the Deck
 
-`hookshot_options.ini`: 50 % resolution, Minimum preset, 6x frame generation, handheld off.
+`hookshot_options.ini`: 50 % resolution, Custom preset (so the budget below is the one used),
+6x frame generation, handheld off.
 `hookshot_env.txt`: the texture budget and eviction knobs. They are a starting point measured on
 one Deck; tune the budget to your own tolerance. The two that matter:
 
