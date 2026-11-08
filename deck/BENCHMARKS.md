@@ -43,6 +43,29 @@ one that stayed under the allowance. None of them crashed.
 code 0, log ends in the finalized-texture upload path). Reported upstream as
 <https://github.com/NotRexed/Hookshot/issues/862>. The same save is stable on the legacy base.
 
+
+## Manual (windowed) observations
+
+Headless cannot show the compositor, the Steam-UI restart or the door exit, so the windowed runs are
+recorded here by hand. They are observations, not a controlled benchmark; the measurable columns are
+read from the same `hookshot_log.txt` afterwards.
+
+| date | build | config | what happened | fps seen | log facts |
+|---|---|---|---|---|---|
+| 2026-11-09 01:45 | udmabuf base (PR #448) | 50 %, Minimum, 6x | world rendered, walked, **OOM at the save** | ~7 | 1843 draws, GPU 43.5 ms, VRAM 5991/6037, `Not enough memory for command submission` |
+| 2026-11-09 02:15 | udmabuf + giveback | 50 %, Minimum, 6x | walked ~3 min, then **Steam UI restarted** under it | 7–15 | VRAM 6099/6144, textures 4005 MB peak, GPU 26 → 69 ms |
+| 2026-11-09 07:47 | legacy + eviction (`stable`) | 1200/128/1500 | **stable**, walked, lighting and texture flicker, dips | 6–15 | max submit 208 ms, max upload 340 ms (288 MB texture), VRAM 7023/6144 |
+| 2026-11-09 07:55 | legacy + eviction (`fps`) | 1500/128/800 | stable, no visible difference from `stable` | 6–15 | same class |
+| 2026-11-09 09:35 | main `58af2c0` + eviction | 1200/128/1500 | looked nicer, **exited at the room door** | ~15 before | 856 draws, VRAM 3840/6027, no device lost, exit code 0 |
+| 2026-11-09 09:41 | main + eviction, `KEEP_FINALIZED_MB=0` | 1200/128/1500 | same exit at the door | — | log ends in the finalized-texture upload path |
+
+The two verdicts that only a person can give: the legacy base **does not crash** but flickers; the
+main base **looks better** but exits at the door. That is the trade-off this branch is trying to
+close, and it is why both rows stay in the table.
+
+Add a row after every windowed test: date, build, config, what happened, the fps range you saw, and
+the one or two log facts (`VRAM`, `GPU time`, `slow submit`, `device lost`).
+
 ## Reproducing a row
 
 ```sh
