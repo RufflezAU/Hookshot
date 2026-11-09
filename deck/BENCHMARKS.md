@@ -77,6 +77,15 @@ the one or two log facts (`VRAM`, `GPU time`, `slow submit`, `device lost`).
 | stable 2 | **forest**, 2568 draws | 12.1 | 69.9 | 63.5 | 6099 / 6144 | 2828 |
 | evict3000 2 | room, 689 draws | 57.1 | 42.9 | 50.5 | 5331 / 6138 | 897 |
 
+### 2026-11-09, latest main + the millisecond eviction, precompile off
+
+| build | scene | fps | GPU ms | max submit | VRAM peak / allowed | notes |
+|---|---|---|---|---|---|---|
+| `15ec28d` + eviction, `RX_VK_PRECOMPILE=0` | room, 404 draws | 40.0 | 26.5 | 112.0 | 3116 / 5867 | no OOM, no device lost; the 112 ms submit is a runtime compile |
+
+The precompile-off base is the only way the newer fixes run here: the prepare is 166 s and the
+driver fault happens inside it. The cost is the 112 ms compile spike when a new shader appears.
+
 ### 2026-11-09, two more knobs tried on the legacy build
 
 | config | scene | fps | GPU ms | max submit | VRAM peak / allowed | verdict |

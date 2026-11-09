@@ -73,7 +73,18 @@ HOS_CONFIG=stable ./hookshot-play.sh
   6539/6144. Do not enable it.
 - **PR #792's mesh fallback** (`RX_VK_FORCE_MESH_FALLBACK=1`) boots without the driver crash, but
   the first run compiles a 5.9 GB program cache and loading it takes the process past 11.5 GB RSS.
-  Not practical for play as it stands. It is kept as branch `deck/legacy`; build it the
+  Not practical for play as it stands.
+- **With `RX_VK_PRECOMPILE=0` the latest main runs**: no prepare, no driver fault, the starting
+  room at 40 fps headless (GPU 26.5 ms, VRAM 3116/5867). That is the current test build
+  (`Hookshot-latest2`, `15ec28d` + the millisecond eviction). The cost is a 112 ms compile spike
+  when a new shader first appears.
+
+### Steam shortcut file
+
+Editing `shortcuts.vdf` by hand: the file must end with a trailing **0x08** after the root object's
+0x08. A 0x00 there makes Steam log `CSteamDoc::LoadShortcuts: failed to load shortcut file` and
+delete the file on start — every non-Steam shortcut disappears. Keep a backup and only write it
+while Steam is closed. It is kept as branch `deck/legacy`; build it the
   same way, with the same `deck/` settings (its `deck/` folder predates `configs/`, so copy
   `hookshot_env.txt` from this branch's `configs/stable.env`).
 
