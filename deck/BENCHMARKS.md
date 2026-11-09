@@ -67,6 +67,21 @@ close, and it is why both rows stay in the table.
 Add a row after every windowed test: date, build, config, what happened, the fps range you saw, and
 the one or two log facts (`VRAM`, `GPU time`, `slow submit`, `device lost`).
 
+
+### 2026-11-09, stable vs evict3000 on the legacy build (2 runs each, 240 s)
+
+| run | scene | fps | GPU ms | max submit | VRAM peak / allowed | textures |
+|---|---|---|---|---|---|---|
+| stable 1 | room, 717 draws | 24.7 | 61.5 | 83.0 | 5451 / 6124 | 1049 |
+| evict3000 1 | room, 625 draws | 42.0 | 51.5 | 62.2 | 5835 / 6144 | 1038 |
+| stable 2 | **forest**, 2568 draws | 12.1 | 69.9 | 63.5 | 6099 / 6144 | 2828 |
+| evict3000 2 | room, 689 draws | 57.1 | 42.9 | 50.5 | 5331 / 6138 | 897 |
+
+The steering does not always get out of the room, so three runs are the room and one is the forest —
+the fps column is not comparable across them. In the room runs `evict3000` is clearly better on the
+jerk metric (max submit 50–62 ms against 83 ms, GPU 43–52 against 62). The forest sample is stable 2
+only, so the forest comparison is still open.
+
 ## Reproducing a row
 
 ```sh
