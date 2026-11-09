@@ -120,3 +120,27 @@ upload over a drawn image ...   the finalized-texture path
 slow upload N ms                a stall worth investigating
 device lost / Not enough memory the two memory failures
 ```
+
+### 2026-11-09 late: the best build so far
+
+**`legacy + #477 + samples-passed 4096`** (`Hookshot-legacy477b`): the old base with the
+udmabuf/giveback/eviction patches, #477 (push-descriptor cache + tree-shadow mask) and #487's
+samples-passed 4096. It removed the icon/object cycling; the fog/lighting flicker in the first long
+shot outside remains.
+
+The renderer's flash counter (`RX_VK_FLASH=1`, `RX_VK_SHOTS`, `RX_VK_SHOT_EVERY=1`,
+`RX_VK_FLASH_REGION=8`) over the same 150 s route, same save:
+
+| build | flashes |
+|---|---|
+| new base + SKIP_CODE + #955 (DECK) | 572 |
+| legacy + #477 | 32 |
+| legacy + #477 + samples-passed 4096 | 22 |
+
+Note: the flash config only reaches the game if the launcher honours `HOS_CONFIG`; a launcher that
+always copies `stable.env` silently measures nothing (that was a false "0 flashes" here).
+
+Upstream by 2026-11-09 evening: `main` is 153 commits past `b234b43`, #957 (handle pointer,
+fragment stages only) is merged, with #853/#840/#939 perf work and test switches for garbled
+textures (`RX_VK_KEEP_UNFLUSHABLE=1`) and AMD stripes (`RX_VK_MARKERS_V205=1`). #477 is still closed
+and unmerged; #798 (the icon flicker) is the open report for it.
