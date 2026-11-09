@@ -77,6 +77,13 @@ the one or two log facts (`VRAM`, `GPU time`, `slow submit`, `device lost`).
 | stable 2 | **forest**, 2568 draws | 12.1 | 69.9 | 63.5 | 6099 / 6144 | 2828 |
 | evict3000 2 | room, 689 draws | 57.1 | 42.9 | 50.5 | 5331 / 6138 | 897 |
 
+### 2026-11-09, two more knobs tried on the legacy build
+
+| config | scene | fps | GPU ms | max submit | VRAM peak / allowed | verdict |
+|---|---|---|---|---|---|---|
+| `RX_VK_MIRROR=1`, `MIRROR_MB=512` | forest, 2691 draws | 5.6 | 127.3 | 118.1 | 6539 / 6144 | **worse** — the mirror is off on integrated GPUs for a reason |
+| mesh fallback (PR #792, `RX_VK_FORCE_MESH_FALLBACK=1`) | title only | ~50 | 24.0 | 9.7 | 826 / 5827 | boots (no driver crash) but needs a 5.9 GB program cache; the harness' 11.5 GB RSS cap killed it at 71 s |
+
 The steering does not always get out of the room, so three runs are the room and one is the forest —
 the fps column is not comparable across them. In the room runs `evict3000` is clearly better on the
 jerk metric (max submit 50–62 ms against 83 ms, GPU 43–52 against 62). The forest sample is stable 2

@@ -63,7 +63,13 @@ HOS_CONFIG=stable ./hookshot-play.sh
   So the upstream fixes (#705, #772) cannot be used here yet; tracked in
   <https://github.com/NotRexed/Hookshot/issues/862>.
 - **The older base** (udmabuf branch + giveback, before this rebase) ran the forest at 10–12 fps
-  with no crash but with lighting/texture flicker. It is kept as branch `deck/legacy`; build it the
+  with no crash but with lighting/texture flicker.
+- **The VRAM mirror is off on integrated GPUs by design** (`mirror_on()`: on only for discrete
+  cards). Forcing `RX_VK_MIRROR=1` on the Deck made it much worse: 5.6 fps, GPU 127 ms, VRAM
+  6539/6144. Do not enable it.
+- **PR #792's mesh fallback** (`RX_VK_FORCE_MESH_FALLBACK=1`) boots without the driver crash, but
+  the first run compiles a 5.9 GB program cache and loading it takes the process past 11.5 GB RSS.
+  Not practical for play as it stands. It is kept as branch `deck/legacy`; build it the
   same way, with the same `deck/` settings (its `deck/` folder predates `configs/`, so copy
   `hookshot_env.txt` from this branch's `configs/stable.env`).
 
