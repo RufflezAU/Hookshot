@@ -1,101 +1,71 @@
-# Deck branch — Steam Deck OLED
+# Hookshot — Steam Deck fork
 
-This branch is upstream `main` with the Steam Deck OLED changes on top. It is a normal build of the
-project, made from **your own game dump**; nothing here redistributes any part of the game.
+This fork exists for one device: the **Steam Deck OLED** (RADV VANGOGH, RDNA2, 16 GB shared
+LPDDR5, 4-core Zen 2). It is deliberately **not** a copy of upstream `main`. It tracks a Deck
+branch that is several hundred commits behind, and that is a decision, not neglect.
 
-## What is different from main
+## Why this fork is behind main
 
-Only two things, both small:
+The newer `main` introduces a texture-handle corruption that this device shows constantly: random
+heart, button and item icons flash over the picture, and surfaces take each other's contents
+(upstream #798, folded into the open AMD tracking issue #997 — still unfixed). Every build made from
+that line glitches in Link's house within seconds. It is a wrong-handle binding in the newer
+handle-pointer code, not a setting, and the forks' partial fixes (Vendichii/Fritchii v4) do not
+cover it.
 
-1. **The texture eviction's age is wall-clock milliseconds, not presents** (`gpu/vk/vk_texture.cpp`,
-   `.h`). `texture_sweep` evicts what has been unused for 60 presents over budget and 120 under it.
-   That is 1–2 s at 60 fps, but **10–30 s at 4–6 fps** — and a Deck runs this title's world at
-   4–12 fps. Between sweeps the texture set grew far past the budget (4.0 GB against a 1.2 GB
-   budget), the driver paged VRAM to system memory, GPU time went 26 → 69 ms and submissions to
-   100–183 ms, and the compositor starved. `Texture::last_ms`, the sweep ordered by it, and
-   `RX_VK_EVICT_MIN_MS` (default 1000; sweep 2000; the rendered keep 10 s / 60 s). At 60 fps the
-   numbers are the same as before.
-2. **`nx2/build.py` compiles `gpu/vk` against libstdc++ 14's headers** (`HOOKSHOT_CXX_INCLUDE` /
-   `HOOKSHOT_CXX_LIB`). The AppImage's glibc 2.35 sysroot carries no C++ standard library headers;
-   without this the Linux build stops at `'algorithm' file not found`. The link stays
-   `-static-libstdc++`, so the game folder does not depend on the host's version.
+The **legacy base + PR #477** is the only line that is clean on this hardware. #477 is the
+push-descriptor cache marked stale after the emulator's own pushes plus the tree-shadow mask
+stabilisation. Upstream closed #477 without merging it. It is the core of this fork.
 
-Everything else that matters on this machine is already in main: the udmabuf guest-memory path
-(PR #448), the retired-import giveback (PR #446/#479), the finalized-texture keep that fixes the
-terrain streaks (#593), and the storage-buffer/lighting fixes.
+## What is in this build
 
-## Build
+- Legacy Deck base: udmabuf guest memory, retired-import giveback, time-based texture eviction
+- **PR #477** — push-descriptor cache invalidation + tree-shadow mask stabilisation (no icon cycling)
+- Samples-passed reports read 4096 (#487's sunlight flicker)
+- Deck memory tuning: `RX_VK_VRAM_MB=2000`, `RX_VK_TEX_MAX_MB=256`, `RX_VK_TEX_MAX_DIM=1024`,
+  `RX_VK_EVICT_MIN_MS=3000`
+- `RX_VK_OOT_VISUAL=1` + `RX_VK_OOT_FOG=0.2` — the effects work; the fog scale is our own value
+  (0.08 thins the haze, 0.25+ makes the forest white; 0.2 measured lowest flicker)
+- `RX_VK_NO_DESC_REUSE=1`, `RX_VK_NO_PASS_HAZARDS=1`
+- Handheld 720p, 50 % render, FSR upscale; **frame generation off** — at 20 fps the made frames
+  smear the HUD into red bars and make the icons blink
 
-You need:
+## How this fork is optimised (the reasoning)
 
-- the Hookshot AppImage, extracted (`squashfs-root/usr/lib/hookshot` holds the toolchain: clang,
-  the glibc 2.35 sysroot, FFmpeg, SDL2);
-- a `.nup` of your own dump;
-- libstdc++ 14 headers. On Debian/Ubuntu they come from `libstdc++-14-dev`; point
-  `HOOKSHOT_CXX_INCLUDE` and `HOOKSHOT_CXX_LIB` at the unpacked tree.
+The Deck's frame is **CPU-bound, not GPU-bound**: the replay profiler shows the emulator's own
+replay at ~7–10 ms a frame (submit, memory sync, queue submit, draws) while the GPU sits at 8–12 ms.
+The large majority of the frame is the game's recompiled code. So:
 
-```sh
-APP=/path/to/squashfs-root \
-NUP=/path/to/game.nup \
-OUT=/path/to/output \
-HOOKSHOT_CXX_INCLUDE=/path/to/libstdc++-14/usr/include \
-HOOKSHOT_CXX_LIB=/path/to/libstdc++-14/usr/lib/gcc/x86_64-linux-gnu/14 \
-./deck/build.sh
-```
+- **The GPU's idle time goes to data-parallel work, not to the replay.** The replay is serial and
+  branch-heavy; a GPU cannot help it. The GPU *can* take texture swizzle/upload (the current
+  `upload()` CPU staging shows stalls up to **785 ms**, 20 per run), the ASTC→BC3 decode, the
+  write-back gathers and the post chain.
+- **The game code is compiled at `-O2`** (the build defaults to `-O1` with only the hot file at
+  `-O2`); PGO (`RX_PGO=gen` → profile → `RX_PGO=<prof>`) is the next step.
+- **Multi-threading** only where the work is order-independent (the #939 uniform-list family).
 
-The first build translates the game (20–70 minutes on a Deck); later builds reuse the object cache.
+## How this fork is measured
 
-## Run
+Everything here is A/B-tested, not guessed:
 
-Copy `deck/hookshot-play.sh`, `deck/hookshot_env.txt`, `deck/hookshot_options.ini` and
-`deck/configs/` next to the built `hookshot` binary, then run the script (or point a non-Steam
-shortcut at it):
+- **Flash counter** (`RX_VK_FLASH=1`, `RX_VK_FLASH_REGION=8`, with `RX_VK_SHOTS`): counts one-frame
+  flashes in the renderer's own frames. A build is only "clean" at 0 in-game flashes.
+- **Static-view harness** (`flicker_test.py --static`): the save's own camera, no input after the
+  world loads. Repeatable to ±7 %; camera sweeps are not comparable.
+- **Smoothness**: `fps_avg_steady`, `frame_ms_p50`, `frame_ms_p99`, `fps_1pct_low` over the steady
+  half of the run, plus a thermal cool-down between runs (the Deck throttles; uncooled A/B is noise).
 
-```sh
-HOS_CONFIG=stable ./hookshot-play.sh    # or fps, or keepoff
-```
+## Traps learned on this device
 
-`STATE.md` is the current known-good/known-bad state and the exact build/run steps; `configs/`
-lists every measured setting; `BENCHMARKS.md` has the measured fps/GPU/VRAM per build and config,
-with the raw `ab_harness.py` JSON in `benchmarks/`. Read `STATE.md` before changing anything.
+- The flash counter needs `RX_VK_SHOTS`; without it a run silently reports 0 flashes.
+- Frame dumps are 4 GB and halve the frame rate: use `RX_VK_FLASH_DUMPS=0` and clean `shots/`.
+- `HOS_RES_SCALE` is the VI output scale, not the render resolution — it buys no frames.
+- The harness's "world" detection reads draw count > 400; the items menu also passes it. Press
+  **A only** at the title (Plus opens the menu and the run then measures the menu).
+- The launcher must honour `HOS_CONFIG`, or a config silently measures nothing.
+- Steam shortcuts must end with `0x08`, not `0x00`.
 
-`/dev/udmabuf` must exist. The kernel option is `CONFIG_UDMABUF=y`; the node is usually created at
-boot. If it is missing:
+## Builds
 
-```sh
-sudo mknod /dev/udmabuf c 10 258
-sudo chmod 660 /dev/udmabuf
-```
-
-The launcher only forces `HOS_GUEST_MEMFD=1` when the sysfs parameter is hidden *and* `/dev/udmabuf`
-is writable — a forced memfd without a working udmabuf has no import at all.
-
-## Settings on the Deck
-
-`hookshot_options.ini`: 50 % resolution, Custom preset (so the budget below is the one used), 6x
-frame generation, handheld off.
-
-`hookshot_env.txt`, measured over 24 four-minute runs on one Deck:
-
-- `RX_VK_VRAM_MB=1200` — the only texture budget that stayed under the driver's allowance
-  (peak 6099 of 6144 MB). 1500 MB was 83 MB over; 2200 MB went over badly.
-- `RX_VK_TEX_MAX_MB=128` — 256 MB was clearly worse (+211 MB over).
-- `RX_VK_EVICT_MIN_MS=1500` — a little less churn than 1000 at 4–12 fps.
-- `RX_VK_TEX_MAX_DIM=1024`, `RX_VK_MIRROR_MB=192`, `RX_VK_CHECKPOINTS=1`.
-
-The texture budget is a weak lever: 1200 vs 1500 moves peak VRAM by only ~128 MB, because the
-game's buffer pools and imports fill it, not textures. No setting gets comfortably under the
-allowance; the rest has to come from the buffer side or the resolution.
-
-## Known issues
-
-- The Steam UI can restart under the game when the GPU runs out of budget (upstream #581, #604).
-- Movies are audio-desynced below 60 fps in the upstream clock.
-- Frame generation has no movie gate upstream; 6x also multiplies movie frames.
-- Visual flicker on AMD: #593 and the storage-buffer fixes are in main; #763/#774 (crushed
-  shadows, dark models) are still open upstream.
-
-## Credit
-
-The udmabuf path, the import giveback and the finalized-texture keep are upstream's (AzleKayn and
-the contributors). This branch only adds the two changes above and the Deck's settings.
+Built on white-dragon (WSL2, 12 cores) from the same tree with the AppImage toolchain. One change
+per build, measured before the next. The known-good binary is kept beside each build.
