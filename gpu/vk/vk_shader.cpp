@@ -770,7 +770,10 @@ void oot_visual(Shader::IR::Program& program, uint64_t key) {
     // (1: the game's own exposure. 0.65 was for the washed-out outdoors before shaders followed pointers; with the lighting right it
     // made scenes too dark, issue 103)
     static const float exposure = getenv("RX_VK_OOT_EXPOSURE") ? (float)atof(getenv("RX_VK_OOT_EXPOSURE")) : 1.0f;
-    if (const size_t n = Shader::Optimization::ApplyOotVisualWorkaround(program, fog, exposure))
+    // (the bloom's exponent, the final pass's c3+0x34: 1 is the game's. Higher weakens the bloom below 1.0, where
+    // most of it is; RADV's bloom was the overexposure of issue 1101)
+    static const float bloom = getenv("RX_VK_OOT_BLOOM") ? (float)atof(getenv("RX_VK_OOT_BLOOM")) : 1.0f;
+    if (const size_t n = Shader::Optimization::ApplyOotVisualWorkaround(program, fog, exposure, bloom))
         logf("vk: OoT visual workaround: %s program %016llx, %zu edits", program.stage == Shader::Stage::Compute ? "fog" : "exposure",
              (unsigned long long)key, n);
 }

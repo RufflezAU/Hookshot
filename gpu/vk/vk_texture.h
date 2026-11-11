@@ -62,6 +62,7 @@ struct Texture {
     uint32_t gpu_gen = 0;     // (the memory generation when the GPU last wrote it: CPU writes after it are taken)
     bool released = false;    // its texture was finalized after the GPU wrote it: CPU writes count again
     uint32_t release_gen = 0;
+    bool sticky = false;      // (hookshot) made again after an eviction: pinned, so it is not evicted again (anti-thrash)
     uint64_t gpu_wrote_seen = 0;   // (the newest finished GPU write into its storage it was uploaded after)
     uint64_t last_written = 0;     // (the frame the GPU last wrote it: a render target, each frame it is used)
     uint64_t first_written = 0;    // (the frame its GPU contents began: written in that frame alone, a table the game baked)

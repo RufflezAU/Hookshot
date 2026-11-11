@@ -4476,9 +4476,21 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         st_draws++, pass.draws++;
         return;
     }
+    /* (hookshot) A draw's count comes straight from the guest's command, and a misparsed one has reached the GPU here
+       before: 2432696322 vertices (0x91000002) walked as indices, which is seconds of GPU time and a device lost. No
+       real draw of this game is anywhere near this; an absurd count is logged and skipped instead of walked.
+       RX_VK_COUNT_CAP=<n>: the limit (default 16M). */
+    {
+        static const uint32_t cap = getenv("RX_VK_COUNT_CAP") ? (uint32_t)strtoul(getenv("RX_VK_COUNT_CAP"), nullptr, 0) : 16000000u;
+        if (d.count > cap) {
+            static int logged;
+            if (logged++ < 8)
+                logf("vk: draw count %u is past the cap (%u): skipped (RX_VK_COUNT_CAP)", (unsigned)d.count, (unsigned)cap);
+            return;
+        }
+    }
     if (d.indirect) {
-        BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * std::max(d.stride, 16), false);
-        BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
+        BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * std::max(d.stride, 16), false);        BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
         if (!args) SKIP_HERE();
         if (d.indexed) {
             BufferRef ib = gpu_buffer_bind(d.ibuf, 4, false);
@@ -5258,7 +5270,17 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             checkpoint(cmd, p, 'i');   // (a device lost's report names it: a grid read from GPU memory)
             vkCmdDispatchIndirect(cmd, args.buffer, args.offset);
         } else {
-            vkCmdDispatch(cmd, x, y, z);
+            /* (hookshot) A dispatch's grid comes from the guest's command: a misparsed one has cost a 358 ms submit and a
+               stalled frame. Absurd grids are logged and skipped (RX_VK_GRID_CAP=<groups>, default 1M). */
+            static const uint64_t grid_cap = getenv("RX_VK_GRID_CAP") ? strtoull(getenv("RX_VK_GRID_CAP"), nullptr, 0) : 1000000ull;
+            if ((uint64_t)x * y * z > grid_cap) {
+                static int logged;
+                if (logged++ < 8)
+                    logf("vk: dispatch grid %ux%ux%u is past the cap (%llu): skipped (RX_VK_GRID_CAP)", x, y, z,
+                         (unsigned long long)grid_cap);
+            } else {
+                vkCmdDispatch(cmd, x, y, z);
+            }
         }
     }
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");

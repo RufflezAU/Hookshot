@@ -1517,9 +1517,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             const uint64_t ago = frame_no - ev->second.frame;
             if (ago < 600) {
                 remade[p] = ago;
+                /* (hookshot) Pinned from now on. A texture that came back once after an eviction is one the working set
+                   needed: evicted again it would be decoded, uploaded and drawn a frame late for ever, which is the
+                   "textures flickering in and out" a player sees. Pinning costs its bytes; thrashing costs the frame. */
+                p->sticky = true;
                 static int told;
                 if (told++ < 300)
-                    logf("vk: texture #%u %#llx %ux%u NVN %#x made again %llu frames after it was evicted (%s then)", p->id,
+                    logf("vk: texture #%u %#llx %ux%u NVN %#x made again %llu frames after it was evicted (%s then), pinned", p->id,
                          (unsigned long long)p->gpu, p->width, p->height, p->nvn_format, (unsigned long long)ago,
                          ev->second.rendered ? "rendered" : "not rendered");
             }
@@ -2727,6 +2731,14 @@ void texture_frame(uint64_t completed) {
     for (auto& [last, tex] : order) {
         if ((!sweep && total_bytes <= budget / 8 * 7) || now_ms - last < (sweep ? std::max<uint64_t>(2000, min_unused_ms) : min_unused_ms)) break;
         if (tex->last_value > completed) continue;
+        /* (hookshot) A pinned texture (made again after an eviction) stays while the cache is within its cap: over it,
+           the pins give way like any other, oldest first, so a pin can never hold the cache over the budget for ever.
+           RX_VK_STICKY_MB=<n>: the room pins may take past the budget (default 512 MB). */
+        static const uint64_t sticky_extra = [] {
+            const char* e = getenv("RX_VK_STICKY_MB");
+            return (uint64_t)(e ? std::max(0, atoi(e)) : 512) << 20;
+        }();
+        if (tex->sticky && total_bytes <= budget + sticky_extra) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
         // RX_VK_EVICT_RENDERED=1: as before)

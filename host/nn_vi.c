@@ -255,11 +255,21 @@ static void realtime_step(int64_t now) {
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
     double ratio = sum / count * 60.0 + carry;
-    ratio = ratio < 1.0 ? 1.0 : ratio > 4.0 ? 4.0 : ratio;
+    /* (hookshot) The floor was a ratio of 4.0 (15 fps): below it the game's own clock stayed at 15 and play ran in slow
+       motion, which reads as "underwater" on a Deck at 12. HOS_REALTIME_FLOOR=<fps> (5 to 60, default 15) lowers it, and
+       the step then keeps real time down to that rate: the game's clock follows the frame time instead of being pinned. */
+    static int floor_fps = -1;
+    if (floor_fps < 0) {
+        floor_fps = getenv("HOS_REALTIME_FLOOR") ? atoi(getenv("HOS_REALTIME_FLOOR")) : 15;
+        floor_fps = floor_fps < 5 ? 5 : floor_fps > 60 ? 60 : floor_fps;
+        if (floor_fps != 15) hos_log("vi: real-time step floor %d fps (HOS_REALTIME_FLOOR)", floor_fps);
+    }
+    const double max_ratio = 60.0 / floor_fps;
+    ratio = ratio < 1.0 ? 1.0 : ratio > max_ratio ? max_ratio : ratio;
     int fps = (int)(60.0 / ratio + 0.5);
-    fps = fps < 15 ? 15 : fps > 60 ? 60 : fps;
+    fps = fps < floor_fps ? floor_fps : fps > 60 ? 60 : fps;
     int *slot = (int *)GP(mod + 0x2c8);
-    if (*slot < 15 || *slot > 60) {
+    if (*slot < floor_fps || *slot > 60) {   /* (hookshot: the floor, not 15: below 15 the game's own field is no reason to stop) */
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;

@@ -5,7 +5,8 @@
 //  - fog: the one compute shader with an add of 2^x and -2^y, the fog integration: its slice distance scaled before
 //    the extinction and scattering accumulation (Orchid: 0.25; 0.08 here; it thins interiors' fog too);
 //  - exposure: a fragment shader with three loads of c3+0x38, the final pass's exposure before its filmic curve (0.65).
-// RX_VK_OOT_VISUAL=0: off. RX_VK_OOT_FOG, RX_VK_OOT_EXPOSURE: the factors.
+// RX_VK_OOT_VISUAL=0: off. RX_VK_OOT_FOG, RX_VK_OOT_EXPOSURE: the factors. RX_VK_OOT_BLOOM: the bloom's
+// exponent (the final pass's c3+0x34; 1: the game's. Higher weakens the bloom below 1.0, where most of it is).
 #pragma once
 
 #include <utility>
@@ -17,7 +18,8 @@
 namespace Shader::Optimization {
 
 /// The edits made (0: not such a shader)
-inline size_t ApplyOotVisualWorkaround(IR::Program& program, f32 fog_scale, f32 exposure_scale) {
+inline size_t ApplyOotVisualWorkaround(IR::Program& program, f32 fog_scale, f32 exposure_scale,
+                                       f32 bloom_scale = 1.0f) {
     const bool fog = program.stage == Stage::Compute;
     const bool exposure = program.stage == Stage::Fragment;
     if (!fog && !exposure) return 0;
@@ -37,26 +39,39 @@ inline size_t ApplyOotVisualWorkaround(IR::Program& program, f32 fog_scale, f32 
                has_opcode(source, IR::Opcode::BitCastU32F32) &&
                has_opcode(source.InstRecursive()->Arg(0), IR::Opcode::FPExp2);
     };
-    std::vector<std::pair<IR::Block*, IR::Inst*>> matches;
+    struct Match {
+        IR::Block* block;
+        IR::Inst* inst;
+        f32 scale;
+    };
+    std::vector<Match> matches;
+    size_t exposure_reads = 0;
     for (IR::Block* block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (fog && inst.GetOpcode() == IR::Opcode::FPAdd32 &&
                 ((negative_exp(inst.Arg(0)) && has_opcode(inst.Arg(1), IR::Opcode::FPExp2)) ||
                  (negative_exp(inst.Arg(1)) && has_opcode(inst.Arg(0), IR::Opcode::FPExp2)))) {
-                matches.emplace_back(block, &inst);
+                matches.push_back({block, &inst, fog_scale});
             }
             if (exposure && inst.GetOpcode() == IR::Opcode::GetCbufF32 && inst.Arg(0).IsImmediate() &&
-                inst.Arg(0).U32() == 3 && inst.Arg(1).IsImmediate() && inst.Arg(1).U32() == 0x38) {
-                matches.emplace_back(block, &inst);
+                inst.Arg(0).U32() == 3 && inst.Arg(1).IsImmediate()) {
+                const u32 offset = inst.Arg(1).U32();
+                if (offset == 0x38) {
+                    matches.push_back({block, &inst, exposure_scale});
+                    ++exposure_reads;
+                } else if (offset == 0x34 && bloom_scale != 1.0f) {
+                    // (the bloom's exponent: higher weakens the bloom below 1.0, where most of it is)
+                    matches.push_back({block, &inst, bloom_scale});
+                }
             }
         }
     }
-    if (matches.size() != (fog ? 1u : 3u)) return 0;
-    for (const auto& [block, inst] : matches) {
+    if ((fog && matches.size() != 1u) || (exposure && exposure_reads != 3u)) return 0;
+    for (const auto& [block, inst, scale] : matches) {
         const auto insertion = block->Instructions().iterator_to(*inst);
         const auto original = block->PrependNewInst(insertion, *inst);
         IR::IREmitter ir{*block, insertion};
-        const auto scaled = ir.FPMul(IR::F32{IR::Value{&*original}}, ir.Imm32(fog ? fog_scale : exposure_scale));
+        const auto scaled = ir.FPMul(IR::F32{IR::Value{&*original}}, ir.Imm32(scale));
         inst->ReplaceUsesWith(scaled);
     }
     return matches.size();

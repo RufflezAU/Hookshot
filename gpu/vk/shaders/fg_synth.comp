@@ -21,6 +21,19 @@ void main() {
     const vec3 still = mix(a0, b0, t);
     const float moved = smoothstep(0.03, 0.09, gap(a0, b0));
     if (moved <= 0.0) { imageStore(dst, g, vec4(still, 1.0)); return; }
+    // (hookshot) High-contrast content - a HUD icon, its edge, a letter, a heart - takes the nearer frame as it is and is
+    // never warped. The flow field's blocks are 16 px, median-smoothed over 3x3 of them (48 px on screen), so a 32 px icon
+    // sits inside one window and inherits the background's motion: warping it moved the icon with the world and showed the
+    // other frame's icon for one made frame, which is the flicker players saw. Only a pixel that changed pays for this.
+    {
+        const ivec2 mx = d - 1;
+        const vec3 c = a0;
+        float edge = gap(c, texelFetch(fa, clamp(g + ivec2(1, 0), ivec2(0), mx), 0).rgb);
+        edge = max(edge, gap(c, texelFetch(fa, clamp(g - ivec2(1, 0), ivec2(0), mx), 0).rgb));
+        edge = max(edge, gap(c, texelFetch(fa, clamp(g + ivec2(0, 1), ivec2(0), mx), 0).rgb));
+        edge = max(edge, gap(c, texelFetch(fa, clamp(g - ivec2(0, 1), ivec2(0), mx), 0).rgb));
+        if (edge > 0.25) { imageStore(dst, g, vec4(t <= 0.5 ? a0 : b0, 1.0)); return; }
+    }
     const vec2 p = vec2(g) + 0.5;
     const vec2 fp = p / 16.0 - 0.5;
     const ivec2 i = ivec2(floor(fp));
