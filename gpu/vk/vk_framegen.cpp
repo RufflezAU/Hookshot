@@ -261,8 +261,13 @@ void display_main() {
             fg.jobs.pop_front();
         }
         if (last_at) {
+            // (hookshot) The estimate the line of shown frames is laid on. It was kept for frames under 100 ms apart and
+            // clamped to 50 ms: a game below 10 fps was outside it and one at 15 fps was read as 20, so the set of three
+            // went out in ~10 ms bursts instead of one frame time apart, and the picture juddered whatever the rate.
+            // A Deck at 15 fps hands over 64 ms frames; 500 ms and 250 ms cover the low rates (a loading hitch is still
+            // left out, and the line restarts from now when it has fallen behind).
             const int64_t d = j.at - last_at;
-            if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
+            if (d > 0 && d < 500000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 250000000)) / 8;
         }
         last_at = j.at;
         if (!stat.since) stat.since = j.at;
@@ -317,7 +322,11 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    /* (hookshot) RX_VK_FRAMEGEN_OFFSCREEN=1: the made frames' pacer runs with no window too, for the tests that cannot
+       open one (a session with no compositor): its line of shown frames and its histogram are then measured offscreen.
+       Off by default: with a window the switch changes nothing */
+    static const bool offscreen_too = getenv("RX_VK_FRAMEGEN_OFFSCREEN") != nullptr;
+    return framegen_wanted(opts.framegen, allow) && (offscreen_too || !dev.offscreen) && !fg.failed;
 }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
