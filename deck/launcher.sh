@@ -11,4 +11,15 @@ fi
 # No core dump. This process is 495 MB with ~2.5 GB mapped, and SteamOS pipes cores to a Python submitter: a crash while
 # closing had the kernel write that out and the desktop was unusable for seconds afterwards. The log keeps the message.
 ulimit -c 0 2>/dev/null
+# GameMode is the standard SteamOS way to raise the CPU governor for a game, and it is the only unprivileged one: the
+# CPU here sits at ~2.25 of a 3.5 GHz ceiling under 'powersave' and the frame is entirely CPU-bound. It is used only
+# when the user is in the 'gamemode' group (deck/setup-perf.sh adds them once); without it gamemoded would raise a
+# password dialog at launch, which must never happen in Gaming Mode.
+case " $(id -Gn 2>/dev/null) " in
+    *" gamemode "*) gamemode_ok=1 ;;
+    *) gamemode_ok=0 ;;
+esac
+if [ "$gamemode_ok" = 1 ] && command -v gamemoderun >/dev/null 2>&1; then
+    exec gamemoderun ./hookshot > hookshot_log.txt 2>&1
+fi
 exec ./hookshot > hookshot_log.txt 2>&1
