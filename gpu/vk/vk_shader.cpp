@@ -454,10 +454,16 @@ Shader::Profile make_profile() {
     p.support_scaled_attributes = false;   // (*_UI2F / *_I2F read as integers, converted in the shader: R32 has no scaled format)
     p.support_multi_viewport = true;
     p.support_sampled_image_array_nonuniform_indexing = true;
-    p.warp_size_potentially_larger_than_guest = false;
+    /* (hookshot, upstream #1507) a graphics stage the GPU cannot pin to 32 lanes runs at its default: 64 on AMD, where only
+       compute is pinned. The translator keeps each 32-lane guest warp to its half of the host's wave then (Eden's long path),
+       which is right at 32 lanes too. Told 32 everywhere, the ballots and shuffles of OoT's fragment shaders ran across both
+       halves: the lighting came out dark and objects glowed, and the light on a surface cycled frame to frame. */
+    p.warp_size_potentially_larger_than_guest =
+        dev.subgroup_size > 32 && (dev.sg32_stages & VK_SHADER_STAGE_ALL_GRAPHICS) != VK_SHADER_STAGE_ALL_GRAPHICS;
     p.lower_left_origin_mode = false;
     p.need_declared_frag_colors = false;
-    p.max_subgroup_size = 32;
+    // (the lanes the broadcast fallbacks walk: all of the host's when a warp may be larger than the guest's)
+    p.max_subgroup_size = p.warp_size_potentially_larger_than_guest ? dev.subgroup_max : 32;
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
     return p;
 }
@@ -817,6 +823,12 @@ uint64_t disk_stamp() {
 #endif
     };
     add(abi, sizeof abi);
+    /* (hookshot, upstream #1507) what of the GPU the translator was told: its warps' lanes. A cache translated before this was
+       told 32 everywhere, so its programs are the wrong ones on a 64-lane graphics stage and must start again. */
+    {
+        const uint32_t lanes[] = {profile().warp_size_potentially_larger_than_guest ? 1u : 0u, profile().max_subgroup_size};
+        add(lanes, sizeof lanes);
+    }
     for (char** e = _environ; e && *e; e++)
         for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
@@ -1147,6 +1159,22 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Shader::RuntimeInfo frt{};
                 frt.previous_stage_stores = vs->program.info.stores;
                 for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
+                /* (hookshot) The alpha test, NVN's nvnColorStateSetAlphaTest: nothing implemented it, so a billboard's
+                   fully transparent texels were never discarded - they still wrote depth, which drew a visible box
+                   around a fairy and cut a rectangle out of the world below it (later draws failed the depth test in
+                   that rectangle). The reference value is still a stub in the host (nvnCommandBufferSetAlphaRef), so
+                   the comparison is against RX_VK_ALPHA_REF, 0 by default: with the usual GREATER that discards only
+                   fully transparent texels, which is what a sprite needs and what a soft glow keeps. NVN's function
+                   values are CompareFunction's in the same order (NEVER 1 .. ALWAYS 8). */
+                if (s.color.alpha_func >= 1 && s.color.alpha_func <= 7) {
+                    static const float alpha_ref = getenv("RX_VK_ALPHA_REF") ? (float)atof(getenv("RX_VK_ALPHA_REF")) : 0.0f;
+                    frt.alpha_test_func = static_cast<Shader::CompareFunction>(s.color.alpha_func - 1);
+                    frt.alpha_test_reference = alpha_ref;
+                    static int told[8];
+                    if (!told[s.color.alpha_func]++)
+                        logf("vk: alpha test: the game's function %u, compared against %.3f (RX_VK_ALPHA_REF)",
+                             s.color.alpha_func, alpha_ref);
+                }
                 static const bool nan_guard = !getenv("RX_VK_NAN_GUARD") || atoi(getenv("RX_VK_NAN_GUARD")) != 0;
                 if (nan_guard) {
                     uint32_t float_targets = 0;
@@ -1550,7 +1578,10 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
         if (logged++ < 40) log_program_stages(s, "dropped stages");
     }
     // the variants of these stages, for these vertex input types and colour output types
-    const uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types);
+    uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types);
+    /* (hookshot) the alpha test changes the fragment program's SPIR-V (a discard in its epilogue), so it is part of the
+       variant's key: without it a program translated with one function would be reused with another */
+    if (!compute) key = key * 1099511628211ull ^ (uint64_t)(s.color.alpha_func & 0xfu);
     auto& variants = programs[key];
     program_cache_load(key, variants);
     for (auto& p : variants) {

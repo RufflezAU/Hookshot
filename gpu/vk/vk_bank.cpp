@@ -32,6 +32,9 @@ struct SampReg {
 std::mutex reg_mu;
 std::vector<TexReg> tex_regs;
 std::vector<SampReg> samp_regs;
+/* (hookshot) bumped whenever a sampler is registered again: sampler_for caches its VkSampler by id and this */
+static std::atomic<uint32_t> samp_gen{1};
+uint32_t samp_generation() { return samp_gen.load(std::memory_order_acquire); }
 std::unordered_map<uint64_t, std::vector<int>> regs_by_serial;
 std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: resolved handles go stale)
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
@@ -172,6 +175,7 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     if ((size_t)id >= samp_regs.size()) samp_regs.resize((size_t)id + 256);
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
+    samp_gen.fetch_add(1, std::memory_order_release);
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);

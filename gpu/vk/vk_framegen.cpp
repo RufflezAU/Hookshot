@@ -83,6 +83,25 @@ int64_t now_ns() {
 
 int multiplier() { return std::clamp(opts.framegen, 1, kMaxMult); }   // (the Insert menu; 1: the game's frames alone)
 
+
+/* (hookshot) RX_VK_FRAMEGEN_SAFE=1: the made frames are the plain blend of the two game frames - no warp, no flow, no
+   thresholds; =2: the last frame held (shown twice: no ghost, no smoothness). Unset or 0: the interpolation as it is.
+   A made frame that is a convex combination of the two game frames cannot hold anything neither of them holds, which is
+   what a soft glow's visible box (a tear along the flow field's plateaus) needs to disappear. */
+int safe_mode() {
+    /* (hookshot) 1 by default now. The motion flow never fixed the artifact it was added for (a soft glow's box is in
+       the game's own frames - proven by running with the plain blend), and it cost two full-screen compute passes a
+       frame plus the ghosting it introduced. The made frame is the plain blend of the two game frames: smooth, and
+       incapable of showing content neither frame holds. RX_VK_FRAMEGEN_SAFE=0 brings the warp back for an A/B. */
+    static const int v = getenv("RX_VK_FRAMEGEN_SAFE") ? std::clamp(atoi(getenv("RX_VK_FRAMEGEN_SAFE")), 0, 3) : 3;
+    return v;
+}
+/// The warp is kept only where it beats a held frame by this much (a share of the two errors' sum): higher is more
+/// conservative (more held frames, no ghosting), lower keeps the warp wherever it is even marginally better.
+float gain_mode() {
+    static const float g = getenv("RX_VK_FRAMEGEN_GAIN") ? std::clamp((float)atof(getenv("RX_VK_FRAMEGEN_GAIN")), 0.01f, 1.0f) : 0.15f;
+    return g;
+}
 /// A compute pipeline over bindings of these types (push descriptors), push constants of push bytes
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<VkDescriptorType> types, uint32_t push,
                const VkSpecializationInfo* spec = nullptr) {
@@ -130,7 +149,7 @@ bool init() {
         !make_pipe(fg.luma, FG_LUMA_COMP_SPV, sizeof FG_LUMA_COMP_SPV, {S, I}, 0) ||
         !make_pipe(fg.flow, FG_FLOW_COMP_SPV, sizeof FG_FLOW_COMP_SPV, {S, S, I}, 0, &spec) ||
         !make_pipe(fg.median, FG_MEDIAN_COMP_SPV, sizeof FG_MEDIAN_COMP_SPV, {S, I}, 0) ||
-        !make_pipe(fg.synth, FG_SYNTH_COMP_SPV, sizeof FG_SYNTH_COMP_SPV, {S, S, S, I}, 4) ||
+        !make_pipe(fg.synth, FG_SYNTH_COMP_SPV, sizeof FG_SYNTH_COMP_SPV, {S, S, S, I}, 12) ||
         !make_pipe(fg.scale, FG_SCALE_COMP_SPV, sizeof FG_SCALE_COMP_SPV, {S, I}, 8))
         return false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -140,7 +159,8 @@ bool init() {
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     vkCreateSampler(dev.device, &si, nullptr, &fg.linear);
     fg.failed = false;
-    logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)", multiplier());
+    logf("vk: frame interpolation ready: %dx the game's frames (made from its last two, shown evenly)%s", multiplier(),
+         safe_mode() == 1 ? ", safe: the plain blend of the two" : safe_mode() == 2 ? ", safe: the last frame held" : "");
     return true;
 }
 
@@ -408,14 +428,17 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     set->made = 0;
     if (blend && m > 1) {
-        pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
-                            {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
-        pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+        const int sm = safe_mode();   // (hookshot) the flow and the median are only needed by the warp (0 and 3)
+        if (sm == 0 || sm == 3) {
+            pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
+                                {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
+            pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
+        }
         for (int k = 1; k < m; k++) {
-            const float t = (float)k / (float)m;
+            const struct { float t, safe, gain; } pc{(float)k / (float)m, (float)sm, gain_mode()};
             pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
                                  {fg.flows[1].view, fg.nearest}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
-                 uw, uh, &t, 4);
+                 uw, uh, &pc, sizeof pc);
         }
         set->made = m - 1;
     }

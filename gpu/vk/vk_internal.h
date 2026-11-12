@@ -54,6 +54,8 @@ struct Device {
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
+    uint32_t subgroup_size = 32;          // (hookshot) the lanes a stage the GPU cannot pin runs at (64 on AMD), and the most
+    uint32_t subgroup_max = 32;           // (upstream #1507: the translator must be told, or a fragment shader's shuffles span both halves)
     uint32_t max_push_descriptors = 0;
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;

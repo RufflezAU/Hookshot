@@ -1095,6 +1095,17 @@ VkSamplerAddressMode wrap(uint8_t w) {
 }
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare)
 VkSampler sampler_for(int id, bool compare) {
+    /* (hookshot) a sampler's VkSampler, by its id, while the registration has not changed: sampler_of takes the global
+       registration mutex and the parameters are hashed over 40 bytes, per texture descriptor, per draw. */
+    static thread_local struct { uint32_t gen; VkSampler plain, cmp; } cache[1 << 12]{};
+    const uint32_t gen = samp_generation();
+    if (id >= 0 && id < (1 << 12)) {
+        auto& c = cache[id];
+        if (c.gen == gen) {
+            const VkSampler hit = compare ? c.cmp : c.plain;
+            if (hit) return hit;
+        }
+    }
     nvn_samp_par p{};
     if (!sampler_of(id, &p)) p.minf = NVN_MIN_FILTER_LINEAR, p.magf = NVN_MAG_FILTER_LINEAR, p.lod_max = 1000.0f;
     uint64_t key = compare ? 0xC0 : 0xAB;
@@ -1105,10 +1116,16 @@ VkSampler sampler_for(int id, bool compare) {
         key = mix(key, w);
     }
     static thread_local std::unordered_map<uint64_t, VkSampler> mine;   // (samplers are never destroyed)
-    if (auto m = mine.find(key); m != mine.end()) return m->second;
+    if (auto m = mine.find(key); m != mine.end()) {
+        if (id >= 0 && id < (1 << 12)) cache[id].gen = gen, (compare ? cache[id].cmp : cache[id].plain) = m->second;
+        return m->second;
+    }
     ParLock lk;
     auto it = samplers.find(key);
-    if (it != samplers.end()) return mine[key] = it->second;
+    if (it != samplers.end()) {
+        if (id >= 0 && id < (1 << 12)) cache[id].gen = gen, (compare ? cache[id].cmp : cache[id].plain) = it->second;
+        return mine[key] = it->second;
+    }
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     ci.magFilter = p.magf == NVN_MAG_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     ci.minFilter = (p.minf == NVN_MIN_FILTER_NEAREST || p.minf == NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST ||
@@ -1163,6 +1180,7 @@ VkSampler sampler_for(int id, bool compare) {
     VkSampler sm = VK_NULL_HANDLE;
     vkCreateSampler(dev.device, &ci, nullptr, &sm);
     samplers.emplace(key, sm);
+    if (id >= 0 && id < (1 << 12)) cache[id].gen = gen, (compare ? cache[id].cmp : cache[id].plain) = sm;
     return sm;
 }
 
@@ -1195,6 +1213,21 @@ struct Dummies {
     Texture* tex[7]{};
     VkImageView view[7]{};
 } dummies;
+
+/// (hookshot, Fritchii v4 / Vendichii b45cb862, upstream 758e563) A texture whose handle the translation took from a
+/// storage buffer's address is never a texture: bound as one it drew garbage - and in the water it made the flicker the
+/// port notes call "the water flickering". The address's own 8 bytes are the test (the count's 16-byte strides are not:
+/// the next elements' words were taken for handles and those draws had no texture at all).
+bool handle_is_storage_pointer(const Shader::Info& info, const Shader::TextureDescriptor& d, uint32_t k) {
+    static const bool off = getenv("RX_VK_HANDLE_POINTER") && getenv("RX_VK_HANDLE_POINTER")[0] == '1';
+    if (off || d.handle_program != ~0U || d.has_secondary) return false;
+    const uint32_t at = d.cbuf_offset + (k << d.size_shift);
+    for (const auto& sb : info.storage_buffers_descriptors) {
+        if (sb.cbuf_index != d.cbuf_index) continue;
+        if (at >= sb.cbuf_offset && at - sb.cbuf_offset < 8) return true;
+    }
+    return false;
+}
 
 /// A handle word pair as the shader reads it (Eden's TexturePair: primary, optionally ORed with a secondary)
 template <class D>
@@ -1820,7 +1853,12 @@ void build_descriptors(const NvnState& s, const Program& p) {
             const size_t first = dw.imgs.size();
             const VkImageViewType vt = view_type(d.type);
             for (uint32_t k = 0; k < d.count; k++) {
-                const uint32_t handle = handle_of(s, st, d, k);
+                /* (hookshot, upstream 758e563) fragment stages only: in the others (the foliage culling's) the textures
+                   went missing and the foliage was culled whenever Link swung his sword. RX_VK_HANDLE_POINTER_ALL=1:
+                   every stage, as the first version did. */
+                static const bool hp_all = getenv("RX_VK_HANDLE_POINTER_ALL") != nullptr;
+                const uint32_t handle = ((hp_all || st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) &&
+                                         handle_is_storage_pointer(info, d, k)) ? 0u : handle_of(s, st, d, k);
                 Texture* tex = nullptr;
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
                                           : VK_NULL_HANDLE;
@@ -1987,9 +2025,22 @@ void checkpoint(VkCommandBuffer cmd, const Program& p, char kind) {
     vkCmdSetCheckpointNV(cmd, (void*)(uintptr_t)(i + 1));
 }
 
+/* (hookshot) the last pushed constants and their layout: a draw of the same program and targets pushes the same 80 bytes */
+thread_local bool last_push_valid = false;
+thread_local VkPipelineLayout last_push_layout = VK_NULL_HANDLE;
+thread_local uint8_t last_push_data[512]{};   // (kPushSize is 80; 512 leaves room if it grows)
+/* (hookshot) the last index buffer bound, so a run of draws over one buffer binds it once */
+thread_local bool last_ib_valid = false;
+thread_local VkBuffer last_ib_buffer = VK_NULL_HANDLE;
+thread_local VkDeviceSize last_ib_offset = 0;
+thread_local VkIndexType last_ib_type = VK_INDEX_TYPE_UINT32;
+
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at) {
     checkpoint(cmd, p, at ? 'd' : 'c');
     if (!p.uses_push) return;   // (most programs read none: a push a draw was ~5% of the replay's commands)
+    /* (hookshot) the same 80 bytes for the same layout are not pushed again: consecutive draws of one program with the
+       same target set push identical constants every time, and a push is a command. RX_VK_PUSH_DEDUPE=0: as before. */
+    static const bool dedupe = !getenv("RX_VK_PUSH_DEDUPE") || atoi(getenv("RX_VK_PUSH_DEDUPE")) != 0;
     uint8_t data[kPushSize]{};
     const float one = 1.0f;
     std::memcpy(data + Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, &one, 4);
@@ -2008,6 +2059,11 @@ void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at) {
         // title's SMAA flagged 94% of the picture as edges: the red and streaked frames)
         const float ra[4] = {(float)at->width, (float)at->height, 0.0f, 0.0f};
         std::memcpy(data + Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET, ra, sizeof ra);
+    }
+    if (dedupe) {
+        if (last_push_valid && last_push_layout == p.layout && !std::memcmp(last_push_data, data, kPushSize)) return;
+        std::memcpy(last_push_data, data, kPushSize);
+        last_push_layout = p.layout, last_push_valid = true;
     }
     vkCmdPushConstants(cmd, p.layout, p.push_stages, 0, kPushSize, data);
 }
@@ -2152,7 +2208,12 @@ Targets targets(NvnState& s) {
         at.color[i] = tex, at.color_view[i] = view, at.color_format[i] = f;
         const uint32_t level = image_level(tex, view_level(v));
         at.color_level[i] = level, at.color_layer[i] = v ? view_layer(v) : 0;
-        const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+        uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+        /* (hookshot, upstream #1338) a raw view of a compressed target is one texel a block: its extent in blocks. The
+           texels' 64 x 64 over the 16 x 16 view of OoT's noise volumes put the render area past the attachment, which
+           lost the device on half the first starts - so the pass was left out and the volumes stayed zero. */
+        const auto bc = [](VkFormat x) { return x >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && x <= VK_FORMAT_BC7_SRGB_BLOCK; };
+        if (bc(tex->format) && !bc(f)) w = (w + 3) / 4, h = (h + 3) / 4;
         at.width = at.width ? std::min(at.width, w) : w;
         at.height = at.height ? std::min(at.height, h) : h;
         at.samples = tex->samples;
@@ -2692,6 +2753,7 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     st_masked_clears++;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    last_push_valid = false, last_ib_valid = false;
     descriptors_disturbed();   // (the next draw pushes all its descriptors, not only those that changed)
     const VkViewport v{0, 0, (float)lw, (float)lh, 0.0f, 1.0f};
     vkCmdSetViewport(cmd, 0, 1, &v);
@@ -2758,6 +2820,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     pass = Pass{};
     work_since_barrier = false;
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    last_push_valid = false, last_ib_valid = false;
     descriptors_disturbed();
     static thread_local uint64_t hits_value = ~0ull;   // (resolved targets last a submission, through its parts: no CPU write is
     if (value != hits_value) {            // collected between them; resolved handles last while their slot and
@@ -4057,11 +4120,15 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         // them for Windows' two seconds and the device was lost, a black screen with the frame counter over it. Its shaders are straight-line
         // sampling code and the cause is still open. It was taken off this list once after a few clean runs: it had not gone. 0 lost
         // of 8 first starts without it, against 7 of 14 with it)
-        static const char* skip = !getenv("RX_VK_SKIP_PROG") ? "53509044401d78d2" : strcmp(getenv("RX_VK_SKIP_PROG"), "-") ? getenv("RX_VK_SKIP_PROG") : nullptr;
+        /* (hookshot, upstream #1338) the default list is empty now: 53509044401d78d2 (OoT's 128 noise-volume draws) lost the
+           device because its BC targets had no colour-attachment usage and its render area was the texels' 64 x 64 over a
+           16 x 16 view. Both are fixed in vk_texture.cpp and targets(), so the pass runs and the volumes are filled: the
+           foliage's dithered LOD crossfade reads them, and with them zero trees went bare at mid distance (#1151). */
+        static const char* skip = getenv("RX_VK_SKIP_PROG") && strcmp(getenv("RX_VK_SKIP_PROG"), "-") ? getenv("RX_VK_SKIP_PROG") : nullptr;
         // (the list parsed once into key prefixes: it was a snprintf and a string compare on every draw)
         static const std::vector<std::pair<uint64_t, uint64_t>> skip_keys = [] {   // (value, mask) of each prefix
             std::vector<std::pair<uint64_t, uint64_t>> v;
-            const char* list = !getenv("RX_VK_SKIP_PROG") ? "53509044401d78d2" : strcmp(getenv("RX_VK_SKIP_PROG"), "-") ? getenv("RX_VK_SKIP_PROG") : "";
+            const char* list = getenv("RX_VK_SKIP_PROG") && strcmp(getenv("RX_VK_SKIP_PROG"), "-") ? getenv("RX_VK_SKIP_PROG") : "";
             for (const char* q = list; *q;) {
                 const char* e = q;
                 while (*e && *e != ',') e++;
@@ -4495,7 +4562,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (d.indexed) {
             BufferRef ib = gpu_buffer_bind(d.ibuf, 4, false);
             if (!ib) SKIP_HERE();
-            vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, itype);
+            if (!last_ib_valid || last_ib_buffer != ib.buffer || last_ib_offset != ib.offset || last_ib_type != itype)
+                vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, itype), last_ib_buffer = ib.buffer, last_ib_offset = ib.offset,
+                last_ib_type = itype, last_ib_valid = true;
             if (cnt) vkCmdDrawIndexedIndirectCount(cmd, args.buffer, args.offset, cnt.buffer, cnt.offset, d.max, std::max(d.stride, 20));
             else vkCmdDrawIndexedIndirect(cmd, args.buffer, args.offset, std::max(d.max, 1), std::max(d.stride, 20));
         } else {
@@ -4506,7 +4575,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         const uint32_t unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         BufferRef ib = gpu_buffer_bind(d.ibuf, (uint64_t)std::max(d.count, 1) * unit, false);
         if (!ib) SKIP_HERE();
-        vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, itype);
+        if (!last_ib_valid || last_ib_buffer != ib.buffer || last_ib_offset != ib.offset || last_ib_type != itype)
+            vkCmdBindIndexBuffer(cmd, ib.buffer, ib.offset, itype), last_ib_buffer = ib.buffer, last_ib_offset = ib.offset,
+            last_ib_type = itype, last_ib_valid = true;
         vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
     } else {
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);

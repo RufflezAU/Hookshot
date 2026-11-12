@@ -57,6 +57,7 @@ void texture_released(uint64_t serial);
 bool texture_of(int id, nvn_tex* t, nvn_view* v, bool* has_view);
 void cs_slot_counts(const NvnState& s, uint32_t* tex, uint32_t* img);   // (hookshot) the compute program's slot counts
 bool sampler_of(int id, nvn_samp_par* p);
+uint32_t samp_generation();   // (hookshot: bumped when a sampler is registered again)
 /// Changes whenever a texture slot may resolve to another texture (a registration, a texture finalized)
 uint64_t registrations_generation();
 /// Changes whenever the slot may resolve to another texture (its registrations, its texture finalized)

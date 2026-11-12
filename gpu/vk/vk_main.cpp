@@ -288,6 +288,12 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         const bool pin = f13.subgroupSizeControl && sc.minSubgroupSize <= 32 && sc.maxSubgroupSize >= 32 && !getenv("RX_VK_NO_SUBGROUP_PIN");
         dev.sg32_stages = pin ? sc.requiredSubgroupSizeStages : 0;
+        /* (hookshot, upstream #1507) and what a stage the GPU cannot pin runs at: AMD's 64 lanes. The translator is told, so
+           that a fragment shader's ballots and shuffles keep each 32-lane guest warp to its half of the host's wave. Told 32
+           everywhere, OoT's lighting came out dark and objects glowed (a basket in Link's house, an RX 5500M) - and here the
+           light on a surface cycled frame to frame. */
+        dev.subgroup_size = sg.subgroupSize;
+        dev.subgroup_max = sc.maxSubgroupSize > sg.subgroupSize ? sc.maxSubgroupSize : sg.subgroupSize;
         logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
              (unsigned)dev.sg32_stages);
     }
