@@ -4980,6 +4980,11 @@ bool init_pools_make(const VkCommandPoolCreateInfo& pi) {
 bool replay_start() {
     menu_init();
     if (!memory_init() || !vma_init(instance_proc())) return false;
+    {   // (hookshot) the staging arenas on an empty device: see texture_staging_prewarm
+        extern void texture_staging_prewarm(int n);
+        static const int prewarm = getenv("RX_VK_STAGING_PREWARM") ? atoi(getenv("RX_VK_STAGING_PREWARM")) : 4;
+        if (prewarm > 0) texture_staging_prewarm(prewarm);
+    }
     VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo tsi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
