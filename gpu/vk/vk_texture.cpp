@@ -2221,6 +2221,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             const uint64_t ago = frame_no - ev->second.frame;
             if (ago < 600) {
                 remade[p] = ago;
+                /* (hookshot) pinned from now on: a texture that came back once after an eviction is one the working set
+                   needed. Evicted again it is decoded, uploaded and drawn a frame late for ever - the "textures flickering
+                   in and out" a player sees. Pinning costs its bytes; thrashing costs the frame. */
+                p->sticky = true;
                 static int told;
                 if (told++ < 300)
                     logf("vk: texture #%u %#llx %ux%u NVN %#x made again %llu frames after it was evicted (%s then)", p->id,
@@ -4215,6 +4219,13 @@ void texture_frame(uint64_t completed) {
             break;
         const bool shifted = drawn_over_shifted(tex);
         if (frame_no - last < need_unused && !shifted) continue;   // (younger: only a dead transient target goes)
+        /* (hookshot) a pinned texture stays while the cache is within its cap; over it the pins give way like any other,
+           oldest first, so a pin can never hold the cache over the budget for ever (RX_VK_STICKY_MB, default 512) */
+        static const uint64_t sticky_extra = [] {
+            const char* e = getenv("RX_VK_STICKY_MB");
+            return (uint64_t)(e ? std::max(0, atoi(e)) : 512) << 20;
+        }();
+        if (tex->sticky && total_bytes <= budget + sticky_extra) continue;
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.

@@ -1046,7 +1046,12 @@ def main():
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
-        vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
+        # (hookshot) the toolchain's C++ headers live outside clang's default search: HOOKSHOT_CXX_INCLUDE, as the Deck
+        # fork's build passed them. Without this every vk file fails with "'algorithm' file not found".
+        _cxx_inc = os.environ.get("HOOKSHOT_CXX_INCLUDE", "")
+        _cxx_flags = (["-isystem", os.path.join(_cxx_inc, "c++", "14"), "-isystem", os.path.join(_cxx_inc, "x86_64-linux-gnu", "c++", "14")]
+                      if _cxx_inc else [])
+        vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + _cxx_flags + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
@@ -1119,7 +1124,7 @@ def main():
         if LINUX:   # (its own copy of the Win32 calls on POSIX)
             cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX]
             pdeps = tree_headers(POSIX)
-            for f in ("win32_posix.c",):
+            for f in ("win32_posix.c", "glibc_compat.c"):
                 vk_jobs.append((cc, os.path.join(POSIX, f), os.path.join(obj_dir, "vk_posix_" + f[:-2] + ".o"), cflags, pdeps))
         jobs += vk_jobs
     vk_only = kit.env_on("RX_VK_ONLY")   # (the renderer alone, the game's objects as they are)
@@ -1268,7 +1273,8 @@ def main():
         t = time.time()
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + ["-fuse-ld=lld", "-shared", "-o", vdll] + \
-                linker("-Map=" + vdll + ".map") + ["-Wl,-Bsymbolic", "-Wl,--gc-sections", "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
+                linker("-Map=" + vdll + ".map") + ["-Wl,-Bsymbolic", "-Wl,--gc-sections", "-static-libstdc++", "-static-libgcc"] + \
+                (["-L" + os.environ["HOOKSHOT_CXX_LIB"]] if os.environ.get("HOOKSHOT_CXX_LIB") else []) + ["@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \

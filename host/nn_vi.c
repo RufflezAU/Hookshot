@@ -312,13 +312,26 @@ volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is
    step is 1/60: discarding it made alternating short/long frames advance more game time than elapsed wall time.
    Keep at most four nominal frames of debt so unpaced fast presents cannot leave a long recovery. Steps beyond
    1/15 s are still dropped, rather than caught up after a long stall. */
+static int realtime_floor(void) {
+    /* (hookshot) HOS_REALTIME_FLOOR=<fps> (5..60, default 15): below this the game's own clock was pinned and play ran in
+       slow motion, which reads as "underwater" on a Deck at 12 fps. The step then keeps real time down to the floor. */
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("HOS_REALTIME_FLOOR") ? atoi(getenv("HOS_REALTIME_FLOOR")) : 15;
+        v = v < 5 ? 5 : v > 60 ? 60 : v;
+        if (v != 15) hos_log("vi: real-time step floor %d fps (HOS_REALTIME_FLOOR)", v);
+    }
+    return v;
+}
 static int realtime_rate(double ratio, int maximum, double *carry) {
+    const int floor_fps = realtime_floor();
+    const double max_ratio = 60.0 / floor_fps;
     ratio += *carry;
-    if (ratio > 4.0) ratio = 4.0;
+    if (ratio > max_ratio) ratio = max_ratio;
     const double least = 60.0 / maximum;
     const double bounded = ratio < least ? least : ratio;
     int fps = (int)(60.0 / bounded + 0.5);
-    fps = fps < 15 ? 15 : fps > maximum ? maximum : fps;
+    fps = fps < floor_fps ? floor_fps : fps > maximum ? maximum : fps;
     *carry = ratio - 60.0 / fps;
     if (*carry < -4.0) *carry = -4.0;
     return fps;
@@ -438,7 +451,7 @@ static void realtime_step(int64_t now) {
     const int top = timed ? 60 : fps_max();
     const double ratio = sum / count * 60.0;
     int *slot = (int *)GP(mod + 0x2c8);
-    if (*slot < 15 || *slot > fps_max()) {
+    if (*slot < realtime_floor() || *slot > fps_max()) {   /* (hookshot: the floor, not 15) */
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
         return;

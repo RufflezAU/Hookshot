@@ -437,7 +437,11 @@ void display_main() {
         }
         if (last_at) {
             const int64_t d = j.at - last_at;
-            if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
+            /* (hookshot) the estimate the line of shown frames is laid on: frames under 100 ms apart only and clamped to
+               50 ms, so a game below 10 fps was outside it and one at 15 was read as 20 - the set of frames went out in
+               ~10 ms bursts instead of one frame time apart. 500 ms and 250 ms cover the low rates; a loading hitch is
+               still left out, and the line restarts from now when it has fallen behind. */
+            if (d > 0 && d < 500000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 250000000)) / 8;
         }
         last_at = j.at;
         if (!stat.since) stat.since = j.at;

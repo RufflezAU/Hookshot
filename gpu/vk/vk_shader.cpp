@@ -1331,6 +1331,20 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Shader::RuntimeInfo frt{};
                 frt.previous_stage_stores = vs->program.info.stores;
                 for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
+                /* (hookshot) the alpha test, NVN's nvnColorStateSetAlphaTest: nothing implemented it, so a billboard's
+                   fully transparent texels were never discarded - they still wrote depth, which drew a visible box around
+                   a fairy and cut a rectangle out of the world below it. The reference is still a stub in the host, so
+                   the comparison is against RX_VK_ALPHA_REF (0 by default: with the usual GREATER that discards only
+                   fully transparent texels, which is what a sprite needs). NVN's values are CompareFunction's order. */
+                if (s.color.alpha_func >= 1 && s.color.alpha_func <= 7) {
+                    static const float alpha_ref = getenv("RX_VK_ALPHA_REF") ? (float)atof(getenv("RX_VK_ALPHA_REF")) : 0.0f;
+                    frt.alpha_test_func = static_cast<Shader::CompareFunction>(s.color.alpha_func - 1);
+                    frt.alpha_test_reference = alpha_ref;
+                    static int told[8];
+                    if (!told[s.color.alpha_func]++)
+                        logf("vk: alpha test: the game's function %u, compared against %.3f (RX_VK_ALPHA_REF)",
+                             s.color.alpha_func, alpha_ref);
+                }
                 if (p.scene_tonemap) {   // (the HDR tone mapper row: PsychoV35; before the NaN guard, which then guards it)
                     const char* why = Shader::Optimization::SceneToneMapPass(fs->program);
                     static std::atomic<int> told{0};
@@ -1887,7 +1901,10 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     }
     // the variants of these stages, for these vertex input types and colour output types
     const bool tonemap = !compute && scene_tonemap_for(stage_code[1]);
-    const uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types, tonemap);
+    uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types, tonemap);
+    /* (hookshot) the alpha test changes the fragment program's SPIR-V (a discard in its epilogue), so it is part of the
+       variant's key: without it a program translated with one function would be reused with another */
+    if (!compute) key = key * 1099511628211ull ^ (uint64_t)(s.color.alpha_func & 0xfu);
     auto& variants = programs[key];
     program_cache_load(key, variants);
     const uint64_t codes[4] = {stage_code[compute ? 5 : 0]->key, !compute && stage_code[1] ? stage_code[1]->key : 0, 0, 0};

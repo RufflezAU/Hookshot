@@ -416,7 +416,11 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         // (RX_VK_BATCH_MAX=<command buffers>: held at most this many, default 32)
         static const size_t cap = getenv("RX_VK_BATCH_MAX") ? (size_t)std::max(1, atoi(getenv("RX_VK_BATCH_MAX"))) : 32;
         if (pend.cbs.size() >= cap) flush_reason = FR_CAP, queue_flush_locked();
-        if (!pend.cbs.empty() && batch_gpu_idle()) flush_reason = FR_OTHER, queue_flush_locked();   // (#1993)
+        /* (hookshot) #1993's flush at an idle GPU, throttled: a submit costs ~1 ms on this Deck (amdgpu re-validates every
+           imported host buffer), so flushing at every submit is far more work than it saves. Raw it stalled the Deck for
+           35.9 s (the game read no input). Only a batch worth a submit goes out early: RX_VK_BATCH_IDLE_MIN (default 2). */
+        static const size_t idle_min = getenv("RX_VK_BATCH_IDLE_MIN") ? (size_t)std::max<size_t>(1, atoi(getenv("RX_VK_BATCH_IDLE_MIN"))) : 2;
+        if (pend.cbs.size() >= idle_min && batch_gpu_idle()) flush_reason = FR_OTHER, queue_flush_locked();   // (#1993)
         return;
     }
     PROF(PROF_QSUBMIT);
@@ -984,7 +988,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             break;
         }
         // ---- state ----
-        case NOP_SET_RT: s.rt = payload<nvn_p_set_rt>(a, avail), s.rt_serial++; break;
+        case NOP_SET_RT: {
+            /* (hookshot) only a target set that actually changed bumps the serial: targets() re-resolves every render
+               target's view and format whenever it moves, and the game re-binds the same set constantly */
+            const nvn_p_set_rt nr = payload<nvn_p_set_rt>(a, avail);
+            if (std::memcmp(&nr, &s.rt, sizeof nr) != 0) s.rt = nr, s.rt_serial++;
+            break;
+        }
         case NOP_VIEWPORTS: {
             const auto v = payload<nvn_p_viewports>(a, avail);
             for (int i = 0; i < v.n && v.first + i < 16; i++) std::memcpy(s.viewport[v.first + i], v.v[i], 16);

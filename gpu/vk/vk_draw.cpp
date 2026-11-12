@@ -3639,9 +3639,15 @@ const char* checkpoint_kind(char c) {
 thread_local uint64_t fallback_payload_address = 0, fallback_records_address = 0;   // (the draw's fallback buffers)
 thread_local uint64_t fallback_indirect_input = 0;
 
+/* (hookshot) the last pushed constants and their layout: consecutive draws of one program with the same targets push
+   identical 80 bytes every time, and a push is a command. RX_VK_PUSH_DEDUPE=0: as before. */
+thread_local bool last_push_valid = false;
+thread_local VkPipelineLayout last_push_layout = VK_NULL_HANDLE;
+thread_local uint8_t last_push_data[512]{};
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, uint32_t fallback_first = 0) {
     checkpoint(cmd, p, at ? 'd' : 'c');
     if (!p.uses_push) return;   // (most programs read none: a push a draw was ~5% of the replay's commands)
+    static const bool push_dedupe = !getenv("RX_VK_PUSH_DEDUPE") || atoi(getenv("RX_VK_PUSH_DEDUPE")) != 0;
     FINE_N(FC_PUSHC, 1);
     uint8_t data[kPushSize]{};
     const float one = 1.0f;
@@ -3668,6 +3674,11 @@ void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, ui
         // title's SMAA flagged 94% of the picture as edges: the red and streaked frames)
         const float ra[4] = {(float)at->width, (float)at->height, 0.0f, 0.0f};
         std::memcpy(data + Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET, ra, sizeof ra);
+    }
+    if (push_dedupe) {
+        if (last_push_valid && last_push_layout == p.layout && !std::memcmp(last_push_data, data, kPushSize)) return;
+        std::memcpy(last_push_data, data, kPushSize);
+        last_push_layout = p.layout, last_push_valid = true;
     }
     vkCmdPushConstants(cmd, p.layout, p.push_stages, 0, kPushSize, data);
 }
@@ -4582,6 +4593,7 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     st_masked_clears++;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    last_push_valid = false;
     vertex_set.on = false;   // (the next draw binds its vertex streams again, as last_vb_valid above asks)
     descriptors_disturbed();   // (the next draw pushes all its descriptors, not only those that changed)
     const VkViewport v{0, 0, (float)lw, (float)lh, 0.0f, 1.0f};
@@ -4679,6 +4691,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     pass() = Pass{};
     work_since_barrier = false;
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    last_push_valid = false;
     vertex_set.on = false, last_ib.on = false;
     descriptors_disturbed();
     static thread_local uint64_t hits_value = ~0ull;   // (resolved targets last a submission, through its parts: no CPU write is
@@ -7502,6 +7515,7 @@ bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p)
     const bool done = temporal_upscale(cmd, p.key, gameplay_network(p.key), in, dw().imgs[0].imageView, out, dw().imgs[ntex].imageView, level);
     // (its actor motion may have drawn with a pipeline, viewport and descriptors of its own: the next draw sets all of its again)
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    last_push_valid = false;
     vertex_set.on = false, last_ib.on = false;
     return done;
 }
@@ -7529,6 +7543,7 @@ static bool temporal_rejected_network(VkCommandBuffer cmd, uint64_t key, Texture
     const bool fsr3 = fsr3_upscale(cmd, key, false, src, in_view, dst, out_view, 0);
     const bool done = fsr3 || ((temporal_wanted() || temporal_off()) && temporal_upscale(cmd, key, false, src, in_view, dst, out_view, 0));
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    last_push_valid = false;
     vertex_set.on = false, last_ib.on = false;
     if (!done) return false;
     full_barrier(cmd);
@@ -8866,7 +8881,17 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             }
             vkCmdDispatchIndirect(cmd, args.buffer, args.offset);
         } else {
-            vkCmdDispatch(cmd, x, y, z);
+            /* (hookshot) a misparsed grid has cost a 358 ms submit and a stalled frame: absurd ones are logged and
+               skipped (RX_VK_GRID_CAP=<groups>, default 1M) */
+            static const uint64_t grid_cap = getenv("RX_VK_GRID_CAP") ? strtoull(getenv("RX_VK_GRID_CAP"), nullptr, 0) : 1000000ull;
+            if ((uint64_t)x * y * z > grid_cap) {
+                static int logged;
+                if (logged++ < 8)
+                    logf("vk: dispatch grid %ux%ux%u is past the cap (%llu): skipped (RX_VK_GRID_CAP)", x, y, z,
+                         (unsigned long long)grid_cap);
+            } else {
+                vkCmdDispatch(cmd, x, y, z);
+            }
         }
     }
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
