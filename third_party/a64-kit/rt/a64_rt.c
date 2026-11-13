@@ -199,10 +199,10 @@ static void site_call(Ctx *c, uint64_t target, uint64_t *site, int call, const c
         return;
     }
     const intptr_t delta = (intptr_t)f - (intptr_t)&a64_lookup;
-    if (delta == (int32_t)delta) {   /* (the first free slot of the two; a full site keeps its first two targets) */
+    if (delta == (int32_t)delta) {   /* (slot 0 first, then adaptive slot 1 for polymorphic sites) */
         const uint64_t entry = target << 32 | (uint32_t)(int32_t)delta;
         if (!__atomic_load_n(&site[0], __ATOMIC_RELAXED)) __atomic_store_n(&site[0], entry, __ATOMIC_RELAXED);
-        else if (!e) __atomic_store_n(&site[1], entry, __ATOMIC_RELAXED);
+        else __atomic_store_n(&site[1], entry, __ATOMIC_RELAXED);
     }
     f(c);
 }

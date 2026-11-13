@@ -83,6 +83,7 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     if (p < A64_MEM || p >= A64_MEM + HOS_GUEST_SPACE) return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t guest = (uint64_t)(p - A64_MEM);
     if (guest < 0x100000) return EXCEPTION_CONTINUE_SEARCH;   /* (a null pointer: the game's own fault) */
+    if (rec->ExceptionInformation[0] == 1 && hos_guard_on_write(guest)) return EXCEPTION_CONTINUE_EXECUTION;
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_RESERVE) return EXCEPTION_CONTINUE_SEARCH;
     static volatile LONG touched;

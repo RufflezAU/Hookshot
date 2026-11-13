@@ -1207,10 +1207,45 @@ NV(nvnQueueSetDebugLabel) {}
    page faults. A class keeps at most POOL_KEEP bytes; the rest goes back to the heap. NVN_NO_POOL=1: the heap. */
 #define POOL_MIN 6       /* 64 bytes */
 #define POOL_MAX 26      /* 64 MiB: bigger blocks use the heap */
-#define POOL_KEEP (64ull << 20)
-static SRWLOCK pool_lock = SRWLOCK_INIT;
-static void *pool_head[POOL_MAX + 1];
-static uint64_t pool_bytes[POOL_MAX + 1];
+#define POOL_KEEP (16ull << 20)
+typedef struct {
+    void *head[POOL_MAX + 1];
+    uint64_t bytes[POOL_MAX + 1];
+} PoolTLS;
+static _Thread_local PoolTLS *pool_tls;
+#ifdef _WIN32
+static DWORD pool_fls = FLS_OUT_OF_INDEXES;
+static VOID WINAPI pool_fls_free(PVOID p) {
+    PoolTLS *pt = (PoolTLS *)p;
+    if (!pt) return;
+    for (unsigned c = POOL_MIN; c <= POOL_MAX; c++) {
+        void *b = pt->head[c];
+        while (b) { void *nx = *(void **)b; free(b); b = nx; }
+    }
+    free(pt);
+}
+static PoolTLS *pool_get_tls(void) {
+    PoolTLS *pt = pool_tls;
+    if (!pt) {
+        if (__atomic_load_n(&pool_fls, __ATOMIC_ACQUIRE) == FLS_OUT_OF_INDEXES) {
+            DWORD idx = FlsAlloc(pool_fls_free);
+            DWORD exp = FLS_OUT_OF_INDEXES;
+            if (!__atomic_compare_exchange_n(&pool_fls, &exp, idx, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED) && idx != FLS_OUT_OF_INDEXES)
+                FlsFree(idx);
+        }
+        pt = (PoolTLS *)calloc(1, sizeof *pt);
+        pool_tls = pt;
+        DWORD idx = __atomic_load_n(&pool_fls, __ATOMIC_ACQUIRE);
+        if (idx != FLS_OUT_OF_INDEXES) FlsSetValue(idx, pt);
+    }
+    return pt;
+}
+#else
+static PoolTLS *pool_get_tls(void) {
+    static _Thread_local PoolTLS pt;
+    return &pt;
+}
+#endif
 static int pool_off(void) {
     static int off = -1;
     if (off < 0) off = env_on("NVN_NO_POOL");
@@ -1226,14 +1261,14 @@ static void *pool_get(size_t n, unsigned *cls) {
     const unsigned c = pool_off() ? POOL_MAX + 1 : pool_class(n);
     *cls = c;
     if (c > POOL_MAX) return malloc(n);
-    AcquireSRWLockExclusive(&pool_lock);
-    void *b = pool_head[c];
+    PoolTLS *pt = pool_get_tls();
+    void *b = pt ? pt->head[c] : NULL;
     if (b) {
-        pool_head[c] = *(void **)b;
-        pool_bytes[c] -= (uint64_t)1 << c;
+        pt->head[c] = *(void **)b;
+        pt->bytes[c] -= (uint64_t)1 << c;
+        return b;
     }
-    ReleaseSRWLockExclusive(&pool_lock);
-    return b ? b : malloc((size_t)1 << c);
+    return malloc((size_t)1 << c);
 }
 static void pool_put(void *b, unsigned cls) {
     if (!b) return;
@@ -1241,15 +1276,14 @@ static void pool_put(void *b, unsigned cls) {
         free(b);
         return;
     }
-    AcquireSRWLockExclusive(&pool_lock);
-    const int keep = pool_bytes[cls] + ((uint64_t)1 << cls) <= POOL_KEEP;
-    if (keep) {
-        *(void **)b = pool_head[cls];
-        pool_head[cls] = b;
-        pool_bytes[cls] += (uint64_t)1 << cls;
+    PoolTLS *pt = pool_get_tls();
+    if (pt && pt->bytes[cls] + ((uint64_t)1 << cls) <= POOL_KEEP) {
+        *(void **)b = pt->head[cls];
+        pt->head[cls] = b;
+        pt->bytes[cls] += (uint64_t)1 << cls;
+        return;
     }
-    ReleaseSRWLockExclusive(&pool_lock);
-    if (!keep) free(b);
+    free(b);
 }
 
 /* (hookshot) A command buffer's recording buffer lives in host memory, and its pointers in this table, not in the
@@ -2142,6 +2176,12 @@ static void tex_copy(const nvn_tex **dst, uint64_t t) {
     const nvn_tex *o = (const nvn_tex *)gw(t, sizeof(nvn_tex));
     if (!o->serial) die("recording refers to an uninitialized texture object %#llx", (unsigned long long)t);
     const uint64_t h = pin_hash(o);
+    static _Thread_local struct { uint64_t h; const nvn_tex *p; } tl_pin[64];
+    const size_t tl_slot = (size_t)(h >> 12) & 63;
+    if (tl_pin[tl_slot].h == h && tl_pin[tl_slot].p && pin_same(tl_pin[tl_slot].p, o)) {
+        *dst = tl_pin[tl_slot].p;
+        return;
+    }
     AcquireSRWLockExclusive(&pin_lock);
     if (npins * 2 >= pin_slots) pins_grow();
     size_t s = (size_t)(h >> 20) & (pin_slots - 1);
@@ -2151,8 +2191,11 @@ static void tex_copy(const nvn_tex **dst, uint64_t t) {
         *pins[s] = *o;
         npins++;
     }
-    *dst = pins[s];
+    const nvn_tex *res = pins[s];
     ReleaseSRWLockExclusive(&pin_lock);
+    tl_pin[tl_slot].h = h;
+    tl_pin[tl_slot].p = res;
+    *dst = res;
 }
 NV(nvnCommandBufferCopyBufferToTexture) {
     nvn_p_copy_bt *r = REC(CB(P(0)), NOP_COPY_B2T, nvn_p_copy_bt);

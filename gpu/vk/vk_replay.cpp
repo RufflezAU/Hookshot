@@ -578,9 +578,10 @@ void gpu_write(VkCommandBuffer cmd, uint64_t gpu, const void* data, uint64_t n) 
 struct UbUpdate {
     uint64_t value;   // the submission that writes it
     uint64_t dst;
-    std::vector<uint8_t> bytes;
+    size_t off, size;
 };
 std::deque<UbUpdate> ub_updates;   // in stream order, oldest first
+std::vector<uint8_t> ub_arena;     // flat backing store for ub_updates payloads
 std::atomic<uint64_t> ub_list_epoch{1};   // (bumped when that deque gains or loses an update)
 thread_local uint64_t ub_gen = 0;   // (each recording thread's: its draws' overlays change with what it passed)
 
@@ -621,6 +622,7 @@ void ub_prune(uint64_t done) {
         ub_updates.pop_front();
         if (ub_first_of_recording) ub_first_of_recording--;
     }
+    if (ub_updates.empty()) ub_arena.clear();
     ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -667,7 +669,7 @@ bool ub_try_gap(size_t first, size_t lim, uint64_t addr, uint64_t n) {
     end.reserve(lim - first);
     for (size_t i = first; i < lim; i++) {
         dst.push_back(ub_updates[i].dst);
-        end.push_back(ub_updates[i].dst + ub_updates[i].bytes.size());
+        end.push_back(ub_updates[i].dst + ub_updates[i].size);
     }
     uint64_t lo = 0, hi = 0;
     if (!ub_gap(dst.data(), end.data(), (int)dst.size(), addr, n, &lo, &hi)) return false;
@@ -739,7 +741,7 @@ uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::functio
     bool any = false;
     for (size_t i = first; i < lim; i++) {
         const UbUpdate& u = ub_updates[i];
-        if (u.dst < addr + n && addr < u.dst + u.bytes.size()) {
+        if (u.dst < addr + n && addr < u.dst + u.size) {
             any = true;
             break;
         }
@@ -751,8 +753,8 @@ uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::functio
     if (!memory_read_as_submitted(addr, p, n)) std::memset(p, 0, n);
     for (size_t i = first; i < lim; i++) {
         const UbUpdate& u = ub_updates[i];
-        const uint64_t lo = std::max(addr, u.dst), hi = std::min(addr + n, u.dst + u.bytes.size());
-        if (lo < hi) std::memcpy(p + (lo - addr), u.bytes.data() + (lo - u.dst), hi - lo);
+        const uint64_t lo = std::max(addr, u.dst), hi = std::min(addr + n, u.dst + u.size);
+        if (lo < hi) std::memcpy(p + (lo - addr), ub_arena.data() + u.off + (lo - u.dst), hi - lo);
     }
     st_ub_overlays++;
     ub_copy_keep(addr, n, base, first, lim, at, view, epoch);
@@ -787,8 +789,8 @@ bool ub_read(uint64_t addr, void* dst, uint64_t n) {
     }
     for (size_t i = 0; i < lim; i++) {
         const UbUpdate& u = ub_updates[i];
-        const uint64_t lo = std::max(addr, u.dst), hi = std::min(addr + n, u.dst + u.bytes.size());
-        if (lo < hi) std::memcpy((uint8_t*)dst + (lo - addr), u.bytes.data() + (lo - u.dst), hi - lo);
+        const uint64_t lo = std::max(addr, u.dst), hi = std::min(addr + n, u.dst + u.size);
+        if (lo < hi) std::memcpy((uint8_t*)dst + (lo - addr), ub_arena.data() + u.off + (lo - u.dst), hi - lo);
     }
     return true;
 }
@@ -803,7 +805,7 @@ void flush_ub_updates(VkCommandBuffer cmd) {
     gp.items = (int)(ub_updates.size() - ub_first_of_recording);
     full_barrier(cmd);
     for (size_t i = ub_first_of_recording; i < ub_updates.size(); i++)
-        gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+        gpu_write(cmd, ub_updates[i].dst, ub_arena.data() + ub_updates[i].off, ub_updates[i].size), gp.bytes += ub_updates[i].size;
     full_barrier(cmd);
 }
 
@@ -1039,7 +1041,9 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                      (unsigned long long)u.dst, (unsigned)u.size, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
             }
             if (u.size && u.size <= avail - sizeof u) {
-                UbUpdate up{rec_value_now, u.dst, std::vector<uint8_t>(a + sizeof u, a + sizeof u + u.size)};
+                const size_t off = ub_arena.size();
+                ub_arena.insert(ub_arena.end(), a + sizeof u, a + sizeof u + u.size);
+                UbUpdate up{rec_value_now, u.dst, off, u.size};
                 ub_updates.push_back(std::move(up));
                 ub_list_epoch.fetch_add(1, std::memory_order_relaxed);
                 ub_gen++;
@@ -1783,10 +1787,12 @@ void bench_frame(int64_t presents) {
     prof_full++;   // (every phase timed, not one draw in eight: the A/B differences are small)
     std::memcpy(prof0, prof_ns, sizeof prof0);
     const size_t ub_before = ub_updates.size();
+    const size_t ub_arena_before = ub_arena.size();
     queue_flush();
     for (int i = 0; i < times; i++) {
         vkDeviceWaitIdle(dev.device);
         ub_updates.resize(ub_before);   // (the last time's uniform updates are written: as if pruned)
+        ub_arena.resize(ub_arena_before);
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& h : frame_submits) bench_replay(h);
         ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());

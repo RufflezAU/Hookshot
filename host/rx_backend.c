@@ -12,6 +12,7 @@
 #include "../gpu/vk/dlss_math.h"
 #include "control.h"
 
+#ifdef RX_NATIVE_WGPU
 /* the WebGPU renderer (gpu/render, renamed) */
 int wgr_start(void *hwnd);
 void wgr_resize(int width, int height);
@@ -35,6 +36,40 @@ void wgr_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, cons
 void wgr_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r,
                           const uint8_t *src, uint64_t row, uint64_t img);
 void wgr_nvn_invalidate(uint64_t gpu, uint64_t size);
+#elif defined(_WIN32)
+/* (Windows without wgpu-native: the back end's calls go nowhere. On Linux host/posix/linux_stubs.c has these, and
+   the Vulkan back end is built there anyway) */
+static int wgr_start(void *hwnd) { (void)hwnd; return 0; }
+static void wgr_resize(int w, int h) { (void)w, (void)h; }
+static const char *wgr_describe(void) { return "none (Vulkan failed)"; }
+static void wgr_stats(int64_t *d, int64_t *s, int64_t *p) { if (d) *d = 0; if (s) *s = 0; if (p) *p = 0; }
+static void wgr_nvn_submit(const uint64_t *h, int n) { (void)h, (void)n; }
+static uint64_t wgr_nvn_fence(void) { return 0; }
+static uint64_t wgr_nvn_pushed(void) { return 0; }
+static uint64_t wgr_nvn_replayed(void) { return 0; }
+static int wgr_nvn_wait(uint64_t f, uint64_t t) { (void)f, (void)t; return 1; }
+static void wgr_wait_writebacks_reading(const void *p, uint64_t n) { (void)p, (void)n; }
+static void wgr_nvn_finish(void) {}
+static void wgr_nvn_present(const nvn_tex *t, const int c[4]) { (void)t, (void)c; }
+static void wgr_nvn_register_texture(int id, const nvn_tex *t, const nvn_view *v) { (void)id, (void)t, (void)v; }
+static void wgr_nvn_register_sampler(int id, const nvn_samp_par *p) { (void)id, (void)p; }
+static void wgr_nvn_set_texture_pool_size(int n) { (void)n; }
+static void wgr_nvn_texture_released(const nvn_tex *t) { (void)t; }
+static void wgr_nvn_program_released(const nvn_prog *p) { (void)p; }
+static void wgr_nvn_read_texels(const nvn_tex *t, unsigned l, unsigned l0, const NVNcopyRegion *r, uint8_t *d,
+                                uint64_t row, uint64_t img) {
+    (void)t, (void)l, (void)l0, (void)r, (void)d, (void)row, (void)img;
+}
+static void wgr_nvn_write_texels(const nvn_tex *t, unsigned l, unsigned l0, const NVNcopyRegion *r, const uint8_t *s,
+                                 uint64_t row, uint64_t img) {
+    (void)t, (void)l, (void)l0, (void)r, (void)s, (void)row, (void)img;
+}
+static void wgr_nvn_invalidate(uint64_t g, uint64_t s) { (void)g, (void)s; }
+void rx_request_frame_dump(void) { hos_log("rx: !dump is WebGPU-only (use RX_VK_DUMP on Vulkan)"); }
+void rx_set_screenshot_ms(int64_t ms) { (void)ms; hos_log("rx: !shots is WebGPU-only (use RX_VK_SHOTS on Vulkan)"); }
+void rx_request_rdoc_capture(int frames) { (void)frames; hos_log("rx: !rdoc is WebGPU-only"); }
+void rx_flash_dark_arm(void) { hos_log("rx: !flasharm is WebGPU-only (use RX_VK_FLASH on Vulkan)"); }
+#endif
 
 /* what the Vulkan back end is given */
 uint8_t *hos_guest_base(void);
@@ -106,20 +141,36 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
     return (int64_t)n;
 }
 static int64_t host_collect(uint32_t **pages) {
+    static int scoped = -1;
+    if (scoped < 0) scoped = getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0;
+    if (scoped) return hos_drain_dirty_pages(pages, 1);
     static uint64_t (*ranges)[2];
     if (!ranges) ranges = malloc(sizeof *ranges * 4096);
     return collect_in(ranges, hos_gpu_guest_ranges(ranges, 4096), pages);
 }
 /* (only within the given guest ranges: the submit-time capture of the mirrored pools, a small part of the 20 ms the
    whole collection takes) */
-static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { return collect_in(ranges, n, pages); }
+static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) {
+    static int scoped = -1;
+    if (scoped < 0) scoped = getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0;
+    if (scoped) return hos_drain_dirty_pages(pages, 1);
+    return collect_in(ranges, n, pages);
+}
 #else
 static int64_t host_collect(uint32_t **pages) {
+    if (getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0)
+        return hos_drain_dirty_pages(pages, 1);
     int64_t n = -1;
     *pages = rx_collect_written(&n);
     return n;
 }
-static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) { (void)ranges, (void)n; *pages = 0; return 0; }
+static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) {
+    (void)ranges, (void)n;
+    if (getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0)
+        return hos_drain_dirty_pages(pages, 1);
+    *pages = 0;
+    return 0;
+}
 #endif
 static void host_free_pages(uint32_t *pages) { free(pages); }
 static void host_mark_written(const void *p, uint64_t n) {

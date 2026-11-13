@@ -680,7 +680,9 @@ static void dec_acquire(Ctx *c) {
     const int64_t wait_until = hos_now_ns() + 100000000;
     for (int tries = 0; !d->qn && !d->eos && (by_tries ? tries < 50 : !d->stopped && hos_now_ns() < wait_until); tries++) {
         ReleaseSRWLockExclusive(&d->lock);
+        const int away = hos_vcore_away();
         hos_sleep_ns(2000000);
+        if (away) hos_vcore_back();
         AcquireSRWLockExclusive(&d->lock);
         decode_pending(d);
     }

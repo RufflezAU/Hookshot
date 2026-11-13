@@ -38,6 +38,7 @@
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/hookshot_env.h"
 #endif
+#include <immintrin.h>   /* (_mm_pause: the parameter ring's pushes and its drain) */
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -1108,7 +1109,7 @@ static void output_frame(const int16_t *pcm) {
    HOS_AUDIO_IMMEDIATE=1: every change applied as it comes (as before). */
 enum { OP_VOICE_RELEASE, OP_VOICE_DEST, OP_VOICE_MIX_VOLUME, OP_VOICE_VOLUME, OP_VOICE_PITCH, OP_VOICE_BIQUAD,
        OP_VOICE_STATE, OP_VOICE_APPEND, OP_MIX_RELEASE, OP_MIX_VOLUME, OP_MIX_DEST, OP_MIX_MIX_VOLUME, OP_SPLIT_RELEASE,
-       OP_SPLIT_DEST, OP_SPLIT_VOLUME, OP_SPLIT_BIQUAD, OP_AUX_ENABLE, OP_AUX_MAP, OP_AUX_RELEASE };
+       OP_SPLIT_DEST, OP_SPLIT_VOLUME, OP_SPLIT_BIQUAD, OP_AUX_ENABLE, OP_AUX_MAP, OP_AUX_RELEASE, OP_COMMIT };
 typedef struct {
     int op, idx, tgt;          /* our voice / mix / splitter; a destination mix or splitter (-1: none) */
     int i0, i1, i2;            /* (op-specific: a kind, an index, channels, a state) */
@@ -1117,9 +1118,41 @@ typedef struct {
     WB wb;
     int8_t in[MAX_BUF], out[MAX_BUF];
 } Cmd;
-static Cmd *cmds;
-static int ncmds, cmds_cap;
+#define AU_RING_CAP 8192
+typedef struct {
+    uint64_t seq;
+    Cmd cmd;
+} AuRingSlot;
+static AuRingSlot au_ring[AU_RING_CAP];
+static uint64_t au_ring_tail, au_ring_head;
+static int au_ring_init;
 static int64_t last_update_ns;
+
+static void ring_init(void) {
+    if (__atomic_load_n(&au_ring_init, __ATOMIC_ACQUIRE)) return;
+    au_lock();
+    if (!au_ring_init) {
+        for (uint64_t i = 0; i < AU_RING_CAP; i++) au_ring[i].seq = i;
+        __atomic_store_n(&au_ring_init, 1, __ATOMIC_RELEASE);
+    }
+    au_unlock();
+}
+static void drain_ring(int flush_all);
+static void ring_push(const Cmd *k) {
+    ring_init();
+    const uint64_t pos = __atomic_fetch_add(&au_ring_tail, 1, __ATOMIC_RELAXED);
+    AuRingSlot *s = &au_ring[pos & (AU_RING_CAP - 1)];
+    while (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != pos) {
+        if (TryEnterCriticalSection(&lock)) {
+            drain_ring(1);
+            LeaveCriticalSection(&lock);
+        } else {
+            _mm_pause();
+        }
+    }
+    s->cmd = *k;
+    __atomic_store_n(&s->seq, pos + 1, __ATOMIC_RELEASE);
+}
 
 static void apply(const Cmd *k) {   /* (with the lock held) */
     if (k->op <= OP_VOICE_APPEND) {
@@ -1232,20 +1265,31 @@ static void apply(const Cmd *k) {   /* (with the lock held) */
         break;
     }
 }
-static void submit(const Cmd *k) {   /* (with the lock held) */
+static void submit(const Cmd *k) {
     static int immediate = -1;
     if (immediate < 0) immediate = env_on("HOS_AUDIO_IMMEDIATE");
-    if (ncmds == cmds_cap && !immediate) {
-        const int cap = cmds_cap ? cmds_cap * 2 : 4096;
-        Cmd *grown = (Cmd *)realloc(cmds, (size_t)cap * sizeof *grown);
-        if (grown) cmds = grown, cmds_cap = cap;
-    }
-    if (immediate || ncmds == cmds_cap) apply(k);
-    else cmds[ncmds++] = *k;
+    if (immediate) apply(k);
+    else ring_push(k);
 }
-static void commit(void) {   /* (with the lock held) */
-    for (int i = 0; i < ncmds; i++) apply(&cmds[i]);
-    ncmds = 0;
+static void drain_ring(int flush_all) {   /* (with au_lock held, on the renderer thread) */
+    ring_init();
+    uint64_t head = au_ring_head;
+    uint64_t last_commit = head;
+    uint64_t avail = head;
+    for (;;) {
+        AuRingSlot *s = &au_ring[avail & (AU_RING_CAP - 1)];
+        if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != avail + 1) break;
+        avail++;
+        if (s->cmd.op == OP_COMMIT) last_commit = avail;
+    }
+    const uint64_t end = flush_all ? avail : last_commit;
+    while (head < end) {
+        AuRingSlot *s = &au_ring[head & (AU_RING_CAP - 1)];
+        if (s->cmd.op != OP_COMMIT) apply(&s->cmd);
+        __atomic_store_n(&s->seq, head + AU_RING_CAP, __ATOMIC_RELEASE);
+        head++;
+    }
+    au_ring_head = head;
     for (int i = 0; i < MAX_VOICES; i++) voices[i].nrel_seen = voices[i].nrel;   /* (the finished buffers, to the game) */
 }
 
@@ -1330,7 +1374,8 @@ static DWORD WINAPI renderer_main(void *p) {
         next = audio_mix_deadline(hos_now_ns(), next, period);
         if (!renderer_running) continue;
         au_lock();
-        if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
+        const int64_t upd = __atomic_load_n(&last_update_ns, __ATOMIC_ACQUIRE);
+        drain_ring(hos_now_ns() - upd > 50000000);
         render_frame(pcm, out_channels);
         au_unlock();
         if (gain_frames-- <= 0) gain_want = audio_player_gain(), gain_frames = 20;   /* (the menu read every 100 ms) */
@@ -1358,10 +1403,9 @@ HLE(_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE) { renderer_runn
 HLE(_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 0; }
 HLE(_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE) { renderer_running = 0; renderer_event = 0; dump_finish(); }
 HLE(_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE) {
-    au_lock();
-    commit();
-    last_update_ns = hos_now_ns();
-    au_unlock();
+    Cmd k = {OP_COMMIT};
+    ring_push(&k);
+    __atomic_store_n(&last_update_ns, hos_now_ns(), __ATOMIC_RELEASE);
     RET(0);
 }
 HLE(_ZN2nn5audio33GetAudioRendererElapsedFrameCountEPKNS0_19AudioRendererConfigE) { RET(elapsed_frames); }

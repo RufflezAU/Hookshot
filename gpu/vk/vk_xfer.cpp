@@ -227,7 +227,18 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
     end_pass(cmd);
     GprofSpan gp(cmd, to_image ? "xfer copy buffer->texture (with its barriers)" : "xfer copy texture->buffer (with its barriers)");
     gp.bytes = size;
-    full_barrier(cmd);
+    auto xfer_barrier = [](VkCommandBuffer c, VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst) {
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = src;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.dstStageMask = dst;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(c, &d);
+    };
+    xfer_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
     if (to_image) {
         vkCmdCopyBufferToImage(cmd, span.buffer, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         texture_written(s.tex, "a buffer-to-texture copy");
@@ -237,7 +248,7 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
         if (guest) memory_stamp_gpu(guest, size);   // (textures over that memory are uploaded again)
         texture_gpu_wrote(p.buf, size);           // (and once the copy is done: the stamp came before it ran)
     }
-    full_barrier(cmd);
+    xfer_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
 }
 
 void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
@@ -267,7 +278,19 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
     s.layers = d.layers = std::min(s.layers, d.layers);
     end_pass(cmd);
     GprofSpan gp(cmd, "xfer copy texture->texture (with its barriers)");
-    full_barrier(cmd);
+    auto xfer_barrier = [](VkCommandBuffer c, VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst) {
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = src;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.dstStageMask = dst;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(c, &d);
+    };
+    const VkPipelineStageFlags2 xfer_stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    xfer_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, xfer_stages);
     const bool same_size = s.w == d.w && s.h == d.h && s.d == d.d;
     if (s.tex->bc != d.tex->bc || (s.tex->bc && !same_size)) {   // (big ASTC kept as BC3 on one side: vk_texture.cpp)
         bool done = false;
@@ -295,7 +318,7 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
             }
         }
         if (!done) warn(10, "texture copy into or out of a BC3-kept ASTC texture it cannot make: skipped");
-        full_barrier(cmd);
+        xfer_barrier(cmd, xfer_stages, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
         if (done) texture_written(d.tex, "a copy into a BC texture");
         return;
     }
@@ -317,7 +340,7 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         vkCmdBlitImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
-    full_barrier(cmd);
+    xfer_barrier(cmd, xfer_stages, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     texture_written(d.tex, "a texture-to-texture copy");
 }
 

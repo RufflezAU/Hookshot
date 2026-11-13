@@ -210,13 +210,14 @@ def ldar_stlr(w):
     other guest accesses across them, or hoist an LDAR out of a spin loop. And an STLR followed by an LDAR must not be
     reordered (AArch64's release/acquire are RCsc), which x86 does to a store and a later load unless the store is
     locked. So: LDAR = seq_cst load (a plain mov), STLR = seq_cst store (xchg). MKW: 1,900 LDAR, 1,321 STLR."""
-    size, load, rn, rt = w >> 30, (w >> 22) & 1, (w >> 5) & 31, w & 31
+    size, load, o0, rn, rt = w >> 30, (w >> 22) & 1, (w >> 15) & 1, (w >> 5) & 31, w & 31
     T = UTYPE[size]
     if load:
-        v = "(uint64_t)__atomic_load_n((%s *)A64_PTR(_a), __ATOMIC_SEQ_CST)" % T
+        v = "(uint64_t)__atomic_load_n((%s *)A64_PTR(_a), %s)" % (T, "__ATOMIC_SEQ_CST" if o0 else "__ATOMIC_ACQUIRE")
         return "{ uint64_t _a = c->x[%d]; %s }" % (rn, xw(rt, v) if rt != 31 else "(void)" + v + ";")
-    return ("{ uint64_t _a = c->x[%d]; __atomic_store_n((%s *)A64_PTR(_a), (%s)%s, __ATOMIC_SEQ_CST); A64_MARK(_a, %d); }"
-            % (rn, T, T, xr(rt), 1 << size))
+    mem_ord = "__ATOMIC_SEQ_CST" if o0 else "__ATOMIC_RELEASE"
+    return ("{ uint64_t _a = c->x[%d]; __atomic_store_n((%s *)A64_PTR(_a), (%s)%s, %s); A64_MARK(_a, %d); }"
+            % (rn, T, T, xr(rt), mem_ord, 1 << size))
 
 
 def emit(w):

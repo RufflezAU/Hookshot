@@ -57,43 +57,151 @@ const char* kLumaWgsl = R"(
 }
 )";
 
-// one vector per 4x4 quarter-size texels (16x16 pixels); the search covers +-8 quarter texels (+-32 pixels)
-const char* kFlowWgsl = R"(
-@group(0) @binding(0) var la: texture_2d<f32>;
-@group(0) @binding(1) var lb: texture_2d<f32>;
-@group(0) @binding(2) var flow: texture_storage_2d<rgba16float, write>;
+const char* kDown2Wgsl = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var dst: texture_storage_2d<rgba16float, write>;
 @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let fd = textureDimensions(flow);
-  if (g.x >= fd.x || g.y >= fd.y) { return; }
-  let lm = vec2<i32>(textureDimensions(la)) - vec2<i32>(1);
-  let c = vec2<i32>(g.xy) * 4 + vec2<i32>(2);
-  var pa: array<f32, 64>;
-  for (var i = 0; i < 64; i++) {
-    pa[i] = textureLoad(la, clamp(c + vec2<i32>(i % 8 - 4, i / 8 - 4), vec2<i32>(0), lm), 0).r;
-  }
-  var best = 1e9;
-  var bv = vec2<i32>(0);
-  for (var dy = -RADIUS; dy <= RADIUS; dy++) {
-    for (var dx = -RADIUS; dx <= RADIUS; dx++) {
-      var sad = 0.0;
-      for (var i = 0; i < 64; i++) {
-        let q = clamp(c + vec2<i32>(i % 8 - 4 + dx, i / 8 - 4 + dy), vec2<i32>(0), lm);
-        sad += abs(pa[i] - textureLoad(lb, q, 0).r);
-      }
-      let cost = sad + 0.04 * f32(abs(dx) + abs(dy));
-      if (cost < best) { best = cost; bv = vec2<i32>(dx, dy); }
-    }
-  }
-  textureStore(flow, g.xy, vec4<f32>(vec2<f32>(bv) * 4.0, best / 64.0, 1.0));
+  let d = textureDimensions(dst);
+  if (g.x >= d.x || g.y >= d.y) { return; }
+  let s = textureDimensions(src) - vec2<u32>(1u);
+  let b = g.xy * 2u;
+  let v = textureLoad(src, min(b, s), 0).r
+        + textureLoad(src, min(b + vec2<u32>(1u, 0u), s), 0).r
+        + textureLoad(src, min(b + vec2<u32>(0u, 1u), s), 0).r
+        + textureLoad(src, min(b + vec2<u32>(1u, 1u), s), 0).r;
+  textureStore(dst, g.xy, vec4<f32>(v * 0.25, 0.0, 0.0, 1.0));
 }
 )";
 
-const char* kMedianWgsl = R"(
+// Coarse optical flow at pyramid level L2 (1/16 res): 1 vector per 2x2 L2 texels, 4x4 patch, R=3 (7x7 = 49 candidates, +-48 full-res px).
+// Uses workgroup shared memory tiling (26x26 = 676 floats) so lb is loaded cooperatively instead of per-candidate global fetches.
+const char* kFlowCoarseWgsl = R"(
+@group(0) @binding(0) var la: texture_2d<f32>;
+@group(0) @binding(1) var lb: texture_2d<f32>;
+@group(0) @binding(2) var flow: texture_storage_2d<rgba16float, write>;
+const TILE_W: i32 = 26;
+var<workgroup> tile_b: array<f32, 676>;
+@compute @workgroup_size(8, 8) fn main(
+  @builtin(global_invocation_id) g: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_index) lidx: u32
+) {
+  let lm = vec2<i32>(textureDimensions(la)) - vec2<i32>(1);
+  // Tile origin in lb: group covers 8*2=16 texels, padded by R=3 + patch_half=2 -> origin = wid*16 - 5
+  let tile_org = vec2<i32>(wid.xy) * 16 - vec2<i32>(5);
+  for (var idx = i32(lidx); idx < TILE_W * TILE_W; idx += 64) {
+    let tx = idx % TILE_W;
+    let ty = idx / TILE_W;
+    tile_b[idx] = textureLoad(lb, clamp(tile_org + vec2<i32>(tx, ty), vec2<i32>(0), lm), 0).r;
+  }
+  workgroupBarrier();
+
+  let fd = textureDimensions(flow);
+  if (g.x >= fd.x || g.y >= fd.y) { return; }
+  let c = vec2<i32>(g.xy) * 2 + vec2<i32>(1);
+  var pa: array<f32, 16>;
+  for (var i = 0; i < 16; i++) {
+    pa[i] = textureLoad(la, clamp(c + vec2<i32>(i % 4 - 2, i / 4 - 2), vec2<i32>(0), lm), 0).r;
+  }
+  let base_local = vec2<i32>(lid.xy) * 2 + vec2<i32>(6); // c - tile_org = lid*2 + 6
+  var best = 1e9;
+  var bv = vec2<i32>(0);
+  for (var dy = -3; dy <= 3; dy++) {
+    for (var dx = -3; dx <= 3; dx++) {
+      var sad = 0.0;
+      let o = base_local + vec2<i32>(dx, dy);
+      for (var py = -2; py < 2; py++) {
+        let row = (o.y + py) * TILE_W + (o.x - 2);
+        let pi = (py + 2) * 4;
+        sad += abs(pa[pi]     - tile_b[row])
+             + abs(pa[pi + 1] - tile_b[row + 1])
+             + abs(pa[pi + 2] - tile_b[row + 2])
+             + abs(pa[pi + 3] - tile_b[row + 3]);
+      }
+      let cost = sad + 0.02 * f32(abs(dx) + abs(dy));
+      if (cost < best) { best = cost; bv = vec2<i32>(dx, dy); }
+    }
+  }
+  textureStore(flow, g.xy, vec4<f32>(vec2<f32>(bv), best / 16.0, 1.0));
+}
+)";
+
+// Local refinement pass for L1 and L0: upscales prior level's vector x2 and searches R=2 (5x5 = 25 candidates).
+// Uses 24x24 = 576 shared-memory tile for the local window around the coarse-predicted center when within bounds.
+const char* kFlowRefineWgsl = R"(
+@group(0) @binding(0) var la: texture_2d<f32>;
+@group(0) @binding(1) var lb: texture_2d<f32>;
+@group(0) @binding(2) var prev_flow: texture_2d<f32>;
+@group(0) @binding(3) var flow: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var<uniform> params: vec4<f32>; // x = scale_to_fullres (8.0 for L1, 4.0 for L0)
+const TILE_W: i32 = 24;
+var<workgroup> tile_b: array<f32, 576>;
+@compute @workgroup_size(8, 8) fn main(
+  @builtin(global_invocation_id) g: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_index) lidx: u32
+) {
+  let lm = vec2<i32>(textureDimensions(la)) - vec2<i32>(1);
+  let pfd = vec2<i32>(textureDimensions(prev_flow)) - vec2<i32>(1);
+  // Shared group anchor prediction from the center of the workgroup's parent flow block
+  let grp_seed = clamp(vec2<i32>(wid.xy * 4u + vec2<u32>(2u)), vec2<i32>(0), pfd);
+  let grp_pred = vec2<i32>(round(textureLoad(prev_flow, grp_seed, 0).xy * 2.0));
+  let tile_org = vec2<i32>(wid.xy) * 16 + grp_pred - vec2<i32>(4);
+  for (var idx = i32(lidx); idx < TILE_W * TILE_W; idx += 64) {
+    let tx = idx % TILE_W;
+    let ty = idx / TILE_W;
+    tile_b[idx] = textureLoad(lb, clamp(tile_org + vec2<i32>(tx, ty), vec2<i32>(0), lm), 0).r;
+  }
+  workgroupBarrier();
+
+  let fd = textureDimensions(flow);
+  if (g.x >= fd.x || g.y >= fd.y) { return; }
+  let c = vec2<i32>(g.xy) * 2 + vec2<i32>(1);
+  let pred = vec2<i32>(round(textureLoad(prev_flow, clamp(vec2<i32>(g.xy) / 2, vec2<i32>(0), pfd), 0).xy * 2.0));
+  var pa: array<f32, 16>;
+  for (var i = 0; i < 16; i++) {
+    pa[i] = textureLoad(la, clamp(c + vec2<i32>(i % 4 - 2, i / 4 - 2), vec2<i32>(0), lm), 0).r;
+  }
+  var best = 1e9;
+  var bv = pred;
+  for (var dy = -2; dy <= 2; dy++) {
+    for (var dx = -2; dx <= 2; dx++) {
+      let off = pred + vec2<i32>(dx, dy);
+      var sad = 0.0;
+      let loc = c + off - tile_org;
+      if (loc.x >= 2 && loc.y >= 2 && loc.x + 1 < TILE_W && loc.y + 1 < TILE_W) {
+        for (var py = -2; py < 2; py++) {
+          let row = (loc.y + py) * TILE_W + (loc.x - 2);
+          let pi = (py + 2) * 4;
+          sad += abs(pa[pi]     - tile_b[row])
+               + abs(pa[pi + 1] - tile_b[row + 1])
+               + abs(pa[pi + 2] - tile_b[row + 2])
+               + abs(pa[pi + 3] - tile_b[row + 3]);
+        }
+      } else {
+        for (var i = 0; i < 16; i++) {
+          let q = clamp(c + off + vec2<i32>(i % 4 - 2, i / 4 - 2), vec2<i32>(0), lm);
+          sad += abs(pa[i] - textureLoad(lb, q, 0).r);
+        }
+      }
+      let cost = sad + 0.015 * f32(abs(off.x) + abs(off.y));
+      if (cost < best) { best = cost; bv = off; }
+    }
+  }
+  textureStore(flow, g.xy, vec4<f32>(vec2<f32>(bv) * params.x, best / 16.0, 1.0));
+}
+)";
+
+// Confidence- and luma-weighted 3x3 smoothing + median filter (preserves sharp HUD & foreground edges)
+const char* kSmoothWgsl = R"(
 @group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var dst: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(1) var luma: texture_2d<f32>;
+@group(0) @binding(2) var dst: texture_storage_2d<rgba16float, write>;
 fn med9(v: array<f32, 9>) -> f32 {
   var a = v;
-  for (var i = 0; i < 5; i++) {   // (the 5 smallest in order: the 5th is the median)
+  for (var i = 0; i < 5; i++) {
     for (var j = i + 1; j < 9; j++) {
       if (a[j] < a[i]) { let t = a[i]; a[i] = a[j]; a[j] = t; }
     }
@@ -104,43 +212,67 @@ fn med9(v: array<f32, 9>) -> f32 {
   let d = textureDimensions(dst);
   if (g.x >= d.x || g.y >= d.y) { return; }
   let m = vec2<i32>(d) - vec2<i32>(1);
+  let lm = vec2<i32>(textureDimensions(luma)) - vec2<i32>(1);
+  let lc = textureLoad(luma, clamp(vec2<i32>(g.xy) * 2, vec2<i32>(0), lm), 0).r;
   var xs: array<f32, 9>;
   var ys: array<f32, 9>;
+  var wsum = 0.0;
+  var vsum = vec2<f32>(0.0);
   var e = 0.0;
   for (var i = 0; i < 9; i++) {
-    let f = textureLoad(src, clamp(vec2<i32>(g.xy) + vec2<i32>(i % 3 - 1, i / 3 - 1), vec2<i32>(0), m), 0);
+    let o = vec2<i32>(i % 3 - 1, i / 3 - 1);
+    let q = clamp(vec2<i32>(g.xy) + o, vec2<i32>(0), m);
+    let f = textureLoad(src, q, 0);
+    let lq = textureLoad(luma, clamp(q * 2, vec2<i32>(0), lm), 0).r;
+    let w = exp(-18.0 * abs(lq - lc)) / (1.0 + 12.0 * f.z);
+    vsum += f.xy * w;
+    wsum += w;
     xs[i] = f.x;
     ys[i] = f.y;
     e = max(e, f.z);
   }
-  textureStore(dst, g.xy, vec4<f32>(med9(xs), med9(ys), e, 1.0));
+  let med = vec2<f32>(med9(xs), med9(ys));
+  let bil = select(med, vsum / wsum, wsum > 1e-5);
+  let blended = mix(med, bil, 0.5);
+  textureStore(dst, g.xy, vec4<f32>(blended, e, 1.0));
 }
 )";
 
+// Disocclusion-aware synthesis at 8x8 flow block density
 const char* kSynthWgsl = R"(
 @group(0) @binding(0) var fa: texture_2d<f32>;
 @group(0) @binding(1) var fb: texture_2d<f32>;
 @group(0) @binding(2) var flow: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var dst: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(5) var<uniform> u: vec4<f32>;   // t
-fn fl(q: vec2<i32>) -> vec2<f32> {
-  return textureLoad(flow, clamp(q, vec2<i32>(0), vec2<i32>(textureDimensions(flow)) - vec2<i32>(1)), 0).xy;
+@group(0) @binding(5) var<uniform> u: vec4<f32>;   // x = t
+fn fl(q: vec2<i32>) -> vec3<f32> {
+  return textureLoad(flow, clamp(q, vec2<i32>(0), vec2<i32>(textureDimensions(flow)) - vec2<i32>(1)), 0).xyz;
 }
 @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   let d = textureDimensions(dst);
   if (g.x >= d.x || g.y >= d.y) { return; }
   let t = u.x;
   let p = vec2<f32>(g.xy) + 0.5;
-  // the motion here: the vectors (one per 16x16 pixels, at their centres) bilinearly
-  let fp = p / 16.0 - 0.5;
+  // 8x8 pixel block grid
+  let fp = p / 8.0 - 0.5;
   let i = vec2<i32>(floor(fp));
   let w = fp - floor(fp);
-  let v = mix(mix(fl(i), fl(i + vec2<i32>(1, 0)), w.x), mix(fl(i + vec2<i32>(0, 1)), fl(i + vec2<i32>(1, 1)), w.x), w.y);
+  let f00 = fl(i);
+  let f10 = fl(i + vec2<i32>(1, 0));
+  let f01 = fl(i + vec2<i32>(0, 1));
+  let f11 = fl(i + vec2<i32>(1, 1));
+  let f = mix(mix(f00, f10, w.x), mix(f01, f11, w.x), w.y);
+  let v = f.xy;
   let size = vec2<f32>(d);
   let a = textureSampleLevel(fa, samp, (p - t * v) / size, 0.0).rgb;
   let b = textureSampleLevel(fb, samp, (p + (1.0 - t) * v) / size, 0.0).rgb;
-  textureStore(dst, g.xy, vec4<f32>(mix(a, b, t), 1.0));
+  // When flow error is high (disocclusion or fast unmodeled change), bias toward the temporally closer frame
+  let diff = dot(abs(a - b), vec3<f32>(0.299, 0.587, 0.114));
+  let disocc = clamp((f.z - 0.04) * 6.0 + (diff - 0.15) * 2.5, 0.0, 1.0);
+  let hard_t = select(0.0, 1.0, t >= 0.5);
+  let alpha = mix(t, hard_t, disocc * 0.65);
+  textureStore(dst, g.xy, vec4<f32>(mix(a, b, alpha), 1.0));
 }
 )";
 
@@ -187,10 +319,18 @@ struct Job {
 struct State {
     bool init = false;
     uint32_t w = 0, h = 0;
-    WGPUComputePipeline copy = nullptr, luma = nullptr, flow = nullptr, median = nullptr, synth = nullptr;
+    uint32_t qw0 = 0, qh0 = 0, qw1 = 0, qh1 = 0, qw2 = 0, qh2 = 0;
+    uint32_t fw2 = 0, fh2 = 0, fw1 = 0, fh1 = 0, fw0 = 0, fh0 = 0;
+    WGPUComputePipeline copy = nullptr, luma = nullptr, down2 = nullptr;
+    WGPUComputePipeline flow_coarse = nullptr, flow_refine = nullptr, smooth = nullptr, synth = nullptr;
     WGPUSampler sampler = nullptr;
     WGPUBuffer t_buf[kMaxMult] = {};
-    Tex frames[2], lumas[2], flows[2];
+    WGPUBuffer scale_l1_buf = nullptr, scale_l0_buf = nullptr;
+    Tex frames[2], lumas0[2], lumas1[2], lumas2[2];
+    Tex flow2, flow1, flow0, flow_smooth;
+    WGPUBindGroup luma_bg[2] = {}, down1_bg[2] = {}, down2_bg[2] = {};
+    WGPUBindGroup flow2_bg[2] = {}, flow1_bg[2] = {}, flow0_bg[2] = {}, smooth_bg[2] = {};
+    WGPUBindGroup synth_bg[2][2][kMaxMult] = {};
     int cur = 0;
     bool have_prev = false;
     int64_t last_at = 0;
@@ -202,6 +342,43 @@ struct State {
     std::deque<Job> jobs;
     bool thread_started = false;
 } fg;
+
+void drop_bg(WGPUBindGroup& bg) {
+    if (bg) wgpuBindGroupRelease(bg);
+    bg = nullptr;
+}
+
+WGPUBindGroup make_bg(WGPUComputePipeline pipe, std::initializer_list<WGPUBindGroupEntry> entries) {
+    std::vector<WGPUBindGroupEntry> be(entries);
+    for (size_t i = 0; i < be.size(); i++) be[i].binding = (uint32_t)i;
+    WGPUBindGroupLayout layout = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
+    WGPUBindGroupDescriptor bd{};
+    bd.layout = layout;
+    bd.entryCount = be.size();
+    bd.entries = be.data();
+    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.device, &bd);
+    wgpuBindGroupLayoutRelease(layout);
+    return bg;
+}
+
+WGPUBindGroupEntry tex_entry(WGPUTextureView v) {
+    WGPUBindGroupEntry e{};
+    e.textureView = v;
+    return e;
+}
+
+WGPUBindGroupEntry samp_entry(WGPUSampler s) {
+    WGPUBindGroupEntry e{};
+    e.sampler = s;
+    return e;
+}
+
+WGPUBindGroupEntry buf_entry(WGPUBuffer b) {
+    WGPUBindGroupEntry e{};
+    e.buffer = b;
+    e.size = 16;
+    return e;
+}
 
 WGPUComputePipeline make_compute(const char* wgsl, const char* label) {
     WGPUShaderSourceWGSL src{};
@@ -225,13 +402,10 @@ void init_pipelines() {
     fg.init = true;
     fg.copy = make_compute(kCopyWgsl, "rx framegen copy");
     fg.luma = make_compute(kLumaWgsl, "rx framegen luma");
-    {   // RX_FRAMEGEN_RADIUS=<quarter-size texels> searched each way (default 8: +-32 pixels)
-        const char* e = getenv("RX_FRAMEGEN_RADIUS");
-        const int r = e ? std::clamp(atoi(e), 1, 16) : 8;
-        std::string src = std::string("const RADIUS: i32 = ") + std::to_string(r) + ";\n" + kFlowWgsl;
-        fg.flow = make_compute(src.c_str(), "rx framegen flow");
-    }
-    fg.median = make_compute(kMedianWgsl, "rx framegen median");
+    fg.down2 = make_compute(kDown2Wgsl, "rx framegen down2");
+    fg.flow_coarse = make_compute(kFlowCoarseWgsl, "rx framegen flow coarse");
+    fg.flow_refine = make_compute(kFlowRefineWgsl, "rx framegen flow refine");
+    fg.smooth = make_compute(kSmoothWgsl, "rx framegen smooth");
     fg.synth = make_compute(kSynthWgsl, "rx framegen synth");
     WGPUSamplerDescriptor sd{};
     sd.addressModeU = sd.addressModeV = sd.addressModeW = WGPUAddressMode_ClampToEdge;
@@ -246,6 +420,17 @@ void init_pipelines() {
         d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
         b = wgpuDeviceCreateBuffer(dev.device, &d);
     }
+    auto make_scale_buf = [](float scale) {
+        WGPUBufferDescriptor d{};
+        d.size = 16;
+        d.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+        WGPUBuffer b = wgpuDeviceCreateBuffer(dev.device, &d);
+        const float v[4] = {scale, 0, 0, 0};
+        wgpuQueueWriteBuffer(dev.queue, b, 0, v, sizeof v);
+        return b;
+    };
+    fg.scale_l1_buf = make_scale_buf(1.0f);
+    fg.scale_l0_buf = make_scale_buf(4.0f);
 }
 
 void ensure_size(uint32_t w, uint32_t h) {
@@ -255,49 +440,86 @@ void ensure_size(uint32_t w, uint32_t h) {
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy; });
     }
     for (int i = 0; i < 2; i++) {
+        drop_bg(fg.luma_bg[i]);
+        drop_bg(fg.down1_bg[i]);
+        drop_bg(fg.down2_bg[i]);
+        drop_bg(fg.flow2_bg[i]);
+        drop_bg(fg.flow1_bg[i]);
+        drop_bg(fg.flow0_bg[i]);
+        drop_bg(fg.smooth_bg[i]);
+        for (int s = 0; s < 2; s++)
+            for (int k = 0; k < kMaxMult; k++) drop_bg(fg.synth_bg[i][s][k]);
         drop_tex(fg.frames[i]);
-        drop_tex(fg.lumas[i]);
-        drop_tex(fg.flows[i]);
+        drop_tex(fg.lumas0[i]);
+        drop_tex(fg.lumas1[i]);
+        drop_tex(fg.lumas2[i]);
         for (Tex& t : fg.sets[i].frame) drop_tex(t);
     }
+    drop_tex(fg.flow2);
+    drop_tex(fg.flow1);
+    drop_tex(fg.flow0);
+    drop_tex(fg.flow_smooth);
+
     fg.w = w, fg.h = h;
-    const uint32_t qw = (w + 3) / 4, qh = (h + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
+    fg.qw0 = (w + 3) / 4;
+    fg.qh0 = (h + 3) / 4;
+    fg.qw1 = (fg.qw0 + 1) / 2;
+    fg.qh1 = (fg.qh0 + 1) / 2;
+    fg.qw2 = (fg.qw1 + 1) / 2;
+    fg.qh2 = (fg.qh1 + 1) / 2;
+    fg.fw2 = (fg.qw2 + 1) / 2;
+    fg.fh2 = (fg.qh2 + 1) / 2;
+    fg.fw1 = (fg.qw1 + 1) / 2;
+    fg.fh1 = (fg.qh1 + 1) / 2;
+    fg.fw0 = (fg.qw0 + 1) / 2;
+    fg.fh0 = (fg.qh0 + 1) / 2;
+
     const WGPUTextureUsage rw = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
     for (int i = 0; i < 2; i++) {
         fg.frames[i] = make_tex(w, h, WGPUTextureFormat_RGBA8Unorm, rw | WGPUTextureUsage_CopySrc, "rx framegen frame");
-        fg.lumas[i] = make_tex(qw, qh, WGPUTextureFormat_RGBA16Float, rw, "rx framegen luma");
-        fg.flows[i] = make_tex(cw, ch, WGPUTextureFormat_RGBA16Float, rw, "rx framegen flow");
+        fg.lumas0[i] = make_tex(fg.qw0, fg.qh0, WGPUTextureFormat_RGBA16Float, rw, "rx framegen luma0");
+        fg.lumas1[i] = make_tex(fg.qw1, fg.qh1, WGPUTextureFormat_RGBA16Float, rw, "rx framegen luma1");
+        fg.lumas2[i] = make_tex(fg.qw2, fg.qh2, WGPUTextureFormat_RGBA16Float, rw, "rx framegen luma2");
         for (Tex& t : fg.sets[i].frame)
             t = make_tex(w, h, WGPUTextureFormat_RGBA8Unorm, rw | WGPUTextureUsage_CopyDst | WGPUTextureUsage_CopySrc,
                          "rx framegen shown");
     }
+    fg.flow2 = make_tex(fg.fw2, fg.fh2, WGPUTextureFormat_RGBA16Float, rw, "rx framegen flow2");
+    fg.flow1 = make_tex(fg.fw1, fg.fh1, WGPUTextureFormat_RGBA16Float, rw, "rx framegen flow1");
+    fg.flow0 = make_tex(fg.fw0, fg.fh0, WGPUTextureFormat_RGBA16Float, rw, "rx framegen flow0");
+    fg.flow_smooth = make_tex(fg.fw0, fg.fh0, WGPUTextureFormat_RGBA16Float, rw, "rx framegen flow smooth");
+
+    for (int cur = 0; cur < 2; cur++) {
+        const int prev = cur ^ 1;
+        fg.luma_bg[cur] = make_bg(fg.luma, {tex_entry(fg.frames[cur].view), tex_entry(fg.lumas0[cur].view)});
+        fg.down1_bg[cur] = make_bg(fg.down2, {tex_entry(fg.lumas0[cur].view), tex_entry(fg.lumas1[cur].view)});
+        fg.down2_bg[cur] = make_bg(fg.down2, {tex_entry(fg.lumas1[cur].view), tex_entry(fg.lumas2[cur].view)});
+        fg.flow2_bg[cur] = make_bg(
+            fg.flow_coarse, {tex_entry(fg.lumas2[prev].view), tex_entry(fg.lumas2[cur].view), tex_entry(fg.flow2.view)});
+        fg.flow1_bg[cur] = make_bg(fg.flow_refine,
+                                   {tex_entry(fg.lumas1[prev].view), tex_entry(fg.lumas1[cur].view),
+                                    tex_entry(fg.flow2.view), tex_entry(fg.flow1.view), buf_entry(fg.scale_l1_buf)});
+        fg.flow0_bg[cur] = make_bg(fg.flow_refine,
+                                   {tex_entry(fg.lumas0[prev].view), tex_entry(fg.lumas0[cur].view),
+                                    tex_entry(fg.flow1.view), tex_entry(fg.flow0.view), buf_entry(fg.scale_l0_buf)});
+        fg.smooth_bg[cur] = make_bg(
+            fg.smooth, {tex_entry(fg.flow0.view), tex_entry(fg.lumas0[cur].view), tex_entry(fg.flow_smooth.view)});
+        for (int s = 0; s < 2; s++) {
+            for (int k = 1; k < kMaxMult; k++) {
+                fg.synth_bg[cur][s][k] =
+                    make_bg(fg.synth, {tex_entry(fg.frames[prev].view), tex_entry(fg.frames[cur].view),
+                                       tex_entry(fg.flow_smooth.view), samp_entry(fg.sampler),
+                                       tex_entry(fg.sets[s].frame[k - 1].view), buf_entry(fg.t_buf[k])});
+            }
+        }
+    }
     fg.have_prev = false;
 }
 
-/// A compute pass: `pipe` over x * y groups of 8x8 with these bindings (textures, then a sampler / buffer)
-void dispatch(WGPUCommandEncoder e, WGPUComputePipeline pipe, std::initializer_list<WGPUBindGroupEntry> entries,
-              uint32_t w, uint32_t h) {
-    std::vector<WGPUBindGroupEntry> be(entries);
-    for (size_t i = 0; i < be.size(); i++) be[i].binding = (uint32_t)i;
-    WGPUBindGroupLayout layout = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
-    WGPUBindGroupDescriptor bd{};
-    bd.layout = layout;
-    bd.entryCount = be.size();
-    bd.entries = be.data();
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev.device, &bd);
-    WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(e, nullptr);
+void pass_dispatch(WGPUComputePassEncoder p, WGPUComputePipeline pipe, WGPUBindGroup bg, uint32_t w, uint32_t h) {
     wgpuComputePassEncoderSetPipeline(p, pipe);
     wgpuComputePassEncoderSetBindGroup(p, 0, bg, 0, nullptr);
     wgpuComputePassEncoderDispatchWorkgroups(p, (w + 7) / 8, (h + 7) / 8, 1);
-    wgpuComputePassEncoderEnd(p);
-    wgpuComputePassEncoderRelease(p);
-    wgpuBindGroupRelease(bg);
-    wgpuBindGroupLayoutRelease(layout);
-}
-WGPUBindGroupEntry tex_entry(WGPUTextureView v) {
-    WGPUBindGroupEntry e{};
-    e.textureView = v;
-    return e;
 }
 
 /// RX_FRAMEGEN_DUMP=<seconds> (checking): that long after interpolation started, the last frame, the first made one and the new
@@ -492,12 +714,14 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
     fg.last_at = now;
     // a set the display thread is not showing
     OutSet* set;
+    int set_idx = 0;
     static int64_t waited, frames, since;
     const int64_t w0 = hos_now_ns();
     {
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return !fg.sets[fg.next_set].busy; });
-        set = &fg.sets[fg.next_set];
+        set_idx = fg.next_set;
+        set = &fg.sets[set_idx];
         set->busy = true;
         fg.next_set ^= 1;
     }
@@ -520,24 +744,32 @@ bool framegen_frame(WGPUTextureView view, uint32_t sw, uint32_t sh, int32_t ww, 
         wgpuQueueWriteBuffer(dev.queue, fg.t_buf[k], 0, t, sizeof t);
     }
     WGPUCommandEncoder e = wgpuDeviceCreateCommandEncoder(dev.device, nullptr);
-    const uint32_t qw = (sw + 3) / 4, qh = (sh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
-    dispatch(e, fg.copy, {tex_entry(view), tex_entry(fg.frames[cur].view)}, sw, sh);
-    dispatch(e, fg.luma, {tex_entry(fg.frames[cur].view), tex_entry(fg.lumas[cur].view)}, qw, qh);
+    auto run_pass = [&](WGPUComputePipeline pipe, WGPUBindGroup bg, uint32_t w, uint32_t h) {
+        WGPUComputePassEncoder p = wgpuCommandEncoderBeginComputePass(e, nullptr);
+        pass_dispatch(p, pipe, bg, w, h);
+        wgpuComputePassEncoderEnd(p);
+        wgpuComputePassEncoderRelease(p);
+    };
+    {
+        WGPUBindGroup copy_bg = make_bg(fg.copy, {tex_entry(view), tex_entry(fg.frames[cur].view)});
+        run_pass(fg.copy, copy_bg, sw, sh);
+        wgpuBindGroupRelease(copy_bg);
+    }
+    run_pass(fg.luma, fg.luma_bg[cur], fg.qw0, fg.qh0);
+    run_pass(fg.down2, fg.down1_bg[cur], fg.qw1, fg.qh1);
+    run_pass(fg.down2, fg.down2_bg[cur], fg.qw2, fg.qh2);
     set->made = 0;
     if (blend) {
-        dispatch(e, fg.flow, {tex_entry(fg.lumas[prev].view), tex_entry(fg.lumas[cur].view), tex_entry(fg.flows[0].view)},
-                 cw, ch);
-        dispatch(e, fg.median, {tex_entry(fg.flows[0].view), tex_entry(fg.flows[1].view)}, cw, ch);
+        run_pass(fg.flow_coarse, fg.flow2_bg[cur], fg.fw2, fg.fh2);
+        run_pass(fg.flow_refine, fg.flow1_bg[cur], fg.fw1, fg.fh1);
+        run_pass(fg.flow_refine, fg.flow0_bg[cur], fg.fw0, fg.fh0);
+        run_pass(fg.smooth, fg.smooth_bg[cur], fg.fw0, fg.fh0);
+        WGPUComputePassEncoder sp = wgpuCommandEncoderBeginComputePass(e, nullptr);
         for (int k = 1; k < m; k++) {
-            WGPUBindGroupEntry s{}, b{};
-            s.sampler = fg.sampler;
-            b.buffer = fg.t_buf[k];
-            b.size = 16;
-            dispatch(e, fg.synth,
-                     {tex_entry(fg.frames[prev].view), tex_entry(fg.frames[cur].view), tex_entry(fg.flows[1].view), s,
-                      tex_entry(set->frame[k - 1].view), b},
-                     sw, sh);
+            pass_dispatch(sp, fg.synth, fg.synth_bg[cur][set_idx][k], sw, sh);
         }
+        wgpuComputePassEncoderEnd(sp);
+        wgpuComputePassEncoderRelease(sp);
         set->made = m - 1;
     }
     WGPUTexelCopyTextureInfo src{}, dst{};

@@ -1786,7 +1786,7 @@ static int game_main(int argc, char **argv) {
 #if !defined(_WIN32) && !defined(A64_MEM_ZERO)
             startup_stderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0);
 #endif
-            if (freopen(path, "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+            if (freopen(path, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 65536);
         }
     }
     hos_log("hookshot %s", HOOKSHOT_VERSION);   /* (the log's first line: which build a report comes from) */

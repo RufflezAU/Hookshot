@@ -78,12 +78,18 @@ typedef GuestContext Ctx;
 extern uint8_t a64_dirty[1u << 20];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
-#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[(uint32_t)(a) >> 12], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[(uint32_t)((a) + (n) - 1) >> 12], 1, __ATOMIC_RELEASE))
+#define A64_MARK1(a) __atomic_store_n(&a64_dirty[(uint32_t)(a) >> 12], 1, __ATOMIC_RELEASE)
+#define A64_MARK(a, n) do { \
+    A64_MARK1(a); \
+    if (__builtin_expect((((uint32_t)(a) & 0xFFFu) + (uint32_t)(n) - 1u) >= 4096u, 0)) \
+        A64_MARK1((a) + (n) - 1); \
+} while (0)
 #elif defined(A64_WRITE_TRACK)
 extern uint8_t a64_dirty[1u << 20];
+#define A64_MARK1(a) (a64_dirty[(uint32_t)(a) >> 12] = 1)
 #define A64_MARK(a, n) (a64_dirty[(uint32_t)(a) >> 12] = 1, a64_dirty[(uint32_t)((a) + (n) - 1) >> 12] = 1)
 #else
+#define A64_MARK1(a) ((void)0)
 #define A64_MARK(a, n) ((void)0)
 #endif
 
@@ -91,7 +97,7 @@ A64_INLINE uint64_t recomp_load8(GuestContext *c, uint64_t a) { (void)c; return 
 A64_INLINE uint64_t recomp_load16(GuestContext *c, uint64_t a) { uint16_t v; (void)c; memcpy(&v, A64_PTR(a), 2); return v; }
 A64_INLINE uint64_t recomp_load32(GuestContext *c, uint64_t a) { uint32_t v; (void)c; memcpy(&v, A64_PTR(a), 4); return v; }
 A64_INLINE uint64_t recomp_load64(GuestContext *c, uint64_t a) { uint64_t v; (void)c; memcpy(&v, A64_PTR(a), 8); return v; }
-A64_INLINE void recomp_store8(GuestContext *c, uint64_t a, uint64_t v) { (void)c; *(uint8_t *)A64_PTR(a) = (uint8_t)v; A64_MARK(a, 1); }
+A64_INLINE void recomp_store8(GuestContext *c, uint64_t a, uint64_t v) { (void)c; *(uint8_t *)A64_PTR(a) = (uint8_t)v; A64_MARK1(a); }
 A64_INLINE void recomp_store16(GuestContext *c, uint64_t a, uint64_t v) { uint16_t t = (uint16_t)v; (void)c; memcpy(A64_PTR(a), &t, 2); A64_MARK(a, 2); }
 A64_INLINE void recomp_store32(GuestContext *c, uint64_t a, uint64_t v) { uint32_t t = (uint32_t)v; (void)c; memcpy(A64_PTR(a), &t, 4); A64_MARK(a, 4); }
 A64_INLINE void recomp_store64(GuestContext *c, uint64_t a, uint64_t v) { (void)c; memcpy(A64_PTR(a), &v, 8); A64_MARK(a, 8); }

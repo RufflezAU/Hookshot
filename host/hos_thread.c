@@ -1050,12 +1050,14 @@ uint64_t hos_ticks(void) { return recomp_cntpct(NULL); }
 int64_t hos_now_ns(void) {
     static LARGE_INTEGER freq;
     static int64_t ns_per_tick;
+    static int freq_ready;
     LARGE_INTEGER now;
-    if (!freq.QuadPart) {
+    if (!__atomic_load_n(&freq_ready, __ATOMIC_ACQUIRE)) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
         ns_per_tick = 1000000000LL % f.QuadPart == 0 ? 1000000000LL / f.QuadPart : 0;
         freq = f;
+        __atomic_store_n(&freq_ready, 1, __ATOMIC_RELEASE);
     }
     QueryPerformanceCounter(&now);
     if (ns_per_tick) return (int64_t)now.QuadPart * ns_per_tick;
@@ -1702,7 +1704,9 @@ static void vc_acquire(HosThread *t) {
             HosThread *h = vc_owner[k];
             if ((m >> k & 1) && h && h->priority > t->priority && (!worst || h->priority > worst->priority)) worst = h;
         }
-        if (!worst && hos_now_ns() - t0 > slice)
+        const int64_t now = hos_now_ns();
+        const int64_t waited_pre = now - t0;
+        if (!worst && waited_pre > slice)
             for (int k = 0; k < vc_cores() && !worst; k++)
                 if ((m >> k & 1) && vc_owner[k] && vc_owner[k]->priority == t->priority) worst = vc_owner[k];
         if (worst && !worst->vc_kick) {
@@ -1711,7 +1715,12 @@ static void vc_acquire(HosThread *t) {
             __atomic_store_n(rc ? &rc->poll : &worst->ctx.poll, 1, __ATOMIC_RELAXED);
             vc_st.kicks++;
         }
-        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, 1, 0);
+        const int64_t esc_lim = worst ? esc_better : esc_eq;
+        const int64_t next_lim = (!worst && slice < esc_lim) ? slice : esc_lim;
+        const int64_t rem_ns = next_lim > waited_pre ? next_lim - waited_pre : 0;
+        DWORD wait_ms = (DWORD)((rem_ns + 999999) / 1000000);
+        if (!wait_ms) wait_ms = 1;
+        SleepConditionVariableSRW(&t->vc_cv, &vc_lock, wait_ms, 0);
         if (t->vc_held) break;   /* granted by a release */
         if ((c = vc_free_for(t)) >= 0) {
             vc_dequeue(t);

@@ -218,6 +218,134 @@ int hos_heap_size_fits(uint64_t size) {
     const uint64_t limit = region_floor < HOS_SPACE_END ? region_floor : HOS_SPACE_END;
     return limit >= HOS_HEAP_BASE && size <= limit - HOS_HEAP_BASE;
 }
+
+/* ---- Scoped hardware page-guard write tracking (replaces per-store A64_MARK) --------------------------------- */
+#define GUARD_RING_CAP (1u << 16)
+static SRWLOCK guard_lk = SRWLOCK_INIT;
+static uint8_t *guard_state; /* lazy 1 byte per 4 KB page: 0=unguarded, 1=armed, 2=dirty, 3=unguarding */
+static uint32_t guard_ring[GUARD_RING_CAP];
+static uint32_t guard_head, guard_tail;
+static int guard_overflow;
+
+static void guard_ensure(void) {
+    if (__atomic_load_n(&guard_state, __ATOMIC_ACQUIRE)) return;
+    AcquireSRWLockExclusive(&guard_lk);
+    if (!guard_state) {
+        uint8_t *p = (uint8_t *)VirtualAlloc(NULL, (size_t)(HOS_GUEST_SPACE >> 12), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        __atomic_store_n(&guard_state, p, __ATOMIC_RELEASE);
+    }
+    ReleaseSRWLockExclusive(&guard_lk);
+}
+static int guard_protect_range(uint64_t page0, uint64_t count, int ro) {
+    DWORD old;
+    return VirtualProtect(GP(page0 << 12), (SIZE_T)(count << 12), ro ? PAGE_READONLY : PAGE_READWRITE, &old) != 0;
+}
+void hos_guard_pages(uint64_t guest, uint64_t size) {
+    if (!size || guest >= HOS_GUEST_SPACE) return;
+    guard_ensure();
+    uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
+    if (!gs) return;
+    const uint64_t p0 = guest >> 12;
+    uint64_t p1 = ((guest + size - 1) >> 12) + 1;
+    if (p1 > (HOS_GUEST_SPACE >> 12)) p1 = HOS_GUEST_SPACE >> 12;
+    AcquireSRWLockExclusive(&guard_lk);
+    uint64_t p = p0;
+    while (p < p1) {
+        while (p < p1 && __atomic_load_n(&gs[p], __ATOMIC_RELAXED) != 0) p++;
+        uint64_t run_start = p;
+        while (p < p1 && __atomic_load_n(&gs[p], __ATOMIC_RELAXED) == 0) p++;
+        if (p > run_start && guard_protect_range(run_start, p - run_start, 1)) {
+            for (uint64_t q = run_start; q < p; q++) __atomic_store_n(&gs[q], 1, __ATOMIC_RELEASE);
+        }
+    }
+    ReleaseSRWLockExclusive(&guard_lk);
+}
+void hos_unguard_pages(uint64_t guest, uint64_t size) {
+    uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
+    if (!size || guest >= HOS_GUEST_SPACE || !gs) return;
+    const uint64_t p0 = guest >> 12;
+    uint64_t p1 = ((guest + size - 1) >> 12) + 1;
+    if (p1 > (HOS_GUEST_SPACE >> 12)) p1 = HOS_GUEST_SPACE >> 12;
+    AcquireSRWLockExclusive(&guard_lk);
+    uint64_t p = p0;
+    while (p < p1) {
+        while (p < p1 && __atomic_load_n(&gs[p], __ATOMIC_RELAXED) == 0) p++;
+        uint64_t run_start = p;
+        while (p < p1 && __atomic_load_n(&gs[p], __ATOMIC_RELAXED) != 0) {
+            __atomic_store_n(&gs[p], 3, __ATOMIC_RELAXED);
+            p++;
+        }
+        if (p > run_start) {
+            guard_protect_range(run_start, p - run_start, 0);
+            for (uint64_t q = run_start; q < p; q++) __atomic_store_n(&gs[q], 0, __ATOMIC_RELEASE);
+        }
+    }
+    ReleaseSRWLockExclusive(&guard_lk);
+}
+int hos_guard_on_write(uint64_t guest) {
+    uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
+    if (!gs || guest >= HOS_GUEST_SPACE) return 0;
+    const uint64_t p = guest >> 12;
+    const uint8_t st = __atomic_load_n(&gs[p], __ATOMIC_ACQUIRE);
+    if (st != 1 && st != 3) return 0;
+    AcquireSRWLockExclusive(&guard_lk);
+    const uint8_t cur = __atomic_load_n(&gs[p], __ATOMIC_RELAXED);
+    if (cur == 1) {
+        guard_protect_range(p, 1, 0);
+        __atomic_store_n(&gs[p], 2, __ATOMIC_RELEASE);
+        if (guard_tail - guard_head < GUARD_RING_CAP) {
+            guard_ring[guard_tail++ & (GUARD_RING_CAP - 1)] = (uint32_t)p;
+        } else {
+            guard_overflow = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&guard_lk);
+    return 1;
+}
+int64_t hos_drain_dirty_pages(uint32_t **pages, int rearm) {
+    uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
+    if (!gs) { *pages = NULL; return 0; }
+    AcquireSRWLockExclusive(&guard_lk);
+    if (guard_overflow) {
+        const uint64_t total = HOS_GUEST_SPACE >> 12;
+        uint32_t cap = 1024, n = 0;
+        uint32_t *out = (uint32_t *)malloc((size_t)cap * sizeof *out);
+        for (uint64_t p = 0; p < total; p++) {
+            if (__atomic_load_n(&gs[p], __ATOMIC_RELAXED) == 2) {
+                if (out) {
+                    if (n == cap) {
+                        cap *= 2;
+                        uint32_t *tmp = (uint32_t *)realloc(out, (size_t)cap * sizeof *out);
+                        if (tmp) out = tmp;
+                    }
+                    if (n < cap) out[n++] = (uint32_t)p;
+                }
+                if (rearm && guard_protect_range(p, 1, 1)) __atomic_store_n(&gs[p], 1, __ATOMIC_RELEASE);
+                else __atomic_store_n(&gs[p], 0, __ATOMIC_RELEASE);
+            }
+        }
+        guard_head = guard_tail;
+        guard_overflow = 0;
+        ReleaseSRWLockExclusive(&guard_lk);
+        *pages = out;
+        return (int64_t)n;
+    }
+    const uint32_t count = guard_tail - guard_head;
+    uint32_t *out = count ? (uint32_t *)malloc((size_t)count * sizeof *out) : NULL;
+    uint32_t n = 0;
+    while (guard_head != guard_tail) {
+        const uint32_t p = guard_ring[guard_head++ & (GUARD_RING_CAP - 1)];
+        if (__atomic_load_n(&gs[p], __ATOMIC_RELAXED) == 2) {
+            if (out) out[n++] = p;
+            if (rearm && guard_protect_range(p, 1, 1)) __atomic_store_n(&gs[p], 1, __ATOMIC_RELEASE);
+            else __atomic_store_n(&gs[p], 0, __ATOMIC_RELEASE);
+        }
+    }
+    ReleaseSRWLockExclusive(&guard_lk);
+    *pages = out;
+    return (int64_t)n;
+}
+
 /* nn::os::SetMemoryHeapSize(unsigned long) -> Result */
 HLE(_ZN2nn2os17SetMemoryHeapSizeEm) {
     uint64_t size = ARG(0);

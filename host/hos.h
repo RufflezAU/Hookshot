@@ -53,6 +53,10 @@ int hos_game_is_mkw(void);
 #define HOS_GAME_TITLE "Hookshot"
 void hos_commit(uint64_t addr, uint64_t size);         /* (mkw_glue.c) guest pages made usable by host APIs */
 int hos_mem_region(uint64_t addr, uint64_t size);      /* (hos_mem.c) the control bridge: 0 if not wholly in mapped guest memory */
+void hos_guard_pages(uint64_t guest, uint64_t size);   /* scoped GPU page-guard write tracking */
+void hos_unguard_pages(uint64_t guest, uint64_t size);
+int hos_guard_on_write(uint64_t guest);
+int64_t hos_drain_dirty_pages(uint32_t **pages, int rearm);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);   /* (hos_mem.c: guest memory written by host code, native soft watch) */
 #define HOS_WRITTEN(p, n) hos_mark_written((p), (n))

@@ -64,73 +64,106 @@ static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
    waiter back to its mutex, or gives it the mutex if free (switchbrew "SVC", libnx mutex.c / condvar.c). */
 #define HANDLE_WAIT_MASK 0x40000000u
 #define R_TIMED_OUT 0xEA01
+#define SVC_BUCKETS 256
 
-typedef struct { HosThread *t; uint64_t mutex, key; uint32_t tag; int on_key; } Waiter;
-static Waiter waiters[1024];
-static int nwaiters;
-static SRWLOCK klock = SRWLOCK_INIT;
+typedef struct Waiter {
+    HosThread *t;
+    uint64_t mutex, key;
+    uint32_t tag;
+    int on_key;
+    struct Waiter *prev, *next;
+} Waiter;
+typedef struct _Alignas(64) {
+    SRWLOCK lk;
+    Waiter *head, *tail;
+} SvcBucket;
+static SvcBucket buckets[SVC_BUCKETS];
+
+static unsigned bucket_idx(uint64_t addr) { return (unsigned)((addr >> 3) ^ (addr >> 11) ^ (addr >> 19)) & (SVC_BUCKETS - 1); }
+static void bucket_lock2(unsigned a, unsigned b) {
+    if (a == b) AcquireSRWLockExclusive(&buckets[a].lk);
+    else if (a < b) { AcquireSRWLockExclusive(&buckets[a].lk); AcquireSRWLockExclusive(&buckets[b].lk); }
+    else { AcquireSRWLockExclusive(&buckets[b].lk); AcquireSRWLockExclusive(&buckets[a].lk); }
+}
+static void bucket_unlock2(unsigned a, unsigned b) {
+    if (a == b) ReleaseSRWLockExclusive(&buckets[a].lk);
+    else { ReleaseSRWLockExclusive(&buckets[a].lk); ReleaseSRWLockExclusive(&buckets[b].lk); }
+}
+static void list_push(SvcBucket *bk, Waiter *w) {
+    w->prev = bk->tail;
+    w->next = NULL;
+    if (bk->tail) bk->tail->next = w;
+    else bk->head = w;
+    bk->tail = w;
+}
+static void list_remove(SvcBucket *bk, Waiter *w) {
+    if (w->prev) w->prev->next = w->next;
+    else bk->head = w->next;
+    if (w->next) w->next->prev = w->prev;
+    else bk->tail = w->prev;
+    w->prev = w->next = NULL;
+}
 
 static uint32_t word_get(uint64_t a) { return __atomic_load_n((uint32_t *)GP(a), __ATOMIC_SEQ_CST); }
 static void word_set(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)GP(a), v, __ATOMIC_SEQ_CST); }
-/* User mode changes a mutex word with exclusives (compare-and-swap here) while the kernel holds klock: a kernel
+/* User mode changes a mutex word with exclusives (compare-and-swap here) while the kernel holds the bucket lock: a kernel
    read-modify-write of a word user mode may change must be a compare-and-swap too. */
 static int word_cas(uint64_t a, uint32_t expect, uint32_t v) {
     return __atomic_compare_exchange_n((uint32_t *)GP(a), &expect, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 
-/* The best waiter (lowest priority value, then oldest) for a mutex (on_key 0) or a key (on_key 1). */
-static int best_waiter(uint64_t addr, int on_key, int *others) {
-    int best = -1;
+/* The best waiter (lowest priority value, then oldest) for a mutex (on_key 0) or a key (on_key 1) or address (2). */
+static Waiter *best_waiter(SvcBucket *bk, uint64_t addr, int on_key, int *others) {
+    Waiter *best = NULL;
     *others = 0;
-    for (int i = 0; i < nwaiters; i++) {
-        Waiter *w = &waiters[i];
+    for (Waiter *w = bk->head; w; w = w->next) {
         if (w->on_key != on_key || (on_key ? w->key : w->mutex) != addr) continue;
-        if (best < 0) best = i;
+        if (!best) best = w;
         else {
             (*others)++;
-            if (hos_thread_prio(w->t) < hos_thread_prio(waiters[best].t)) best = i;
+            if (hos_thread_prio(w->t) < hos_thread_prio(best->t)) best = w;
         }
     }
     return best;
 }
-static void remove_waiter(int i) { memmove(&waiters[i], &waiters[i + 1], (nwaiters - i - 1) * sizeof *waiters); nwaiters--; }
-static int find_thread(HosThread *t) {
-    for (int i = 0; i < nwaiters; i++) if (waiters[i].t == t) return i;
-    return -1;
-}
 
-/* Hand a held mutex to its next waiter, or free it. Caller holds klock. */
-static void release_locked(uint64_t mutex) {
-    int others, i = best_waiter(mutex, 0, &others);
-    if (i < 0) { word_set(mutex, 0); return; }
-    Waiter w = waiters[i];
-    remove_waiter(i);
-    word_set(mutex, w.tag | (others ? HANDLE_WAIT_MASK : 0));
-    hos_thread_wake(w.t);
+/* Hand a held mutex to its next waiter, or free it. Caller holds buckets[bucket_idx(mutex)].lk. */
+static void release_locked(SvcBucket *bk, uint64_t mutex) {
+    int others;
+    Waiter *w = best_waiter(bk, mutex, 0, &others);
+    if (!w) { word_set(mutex, 0); return; }
+    HosThread *t = w->t;
+    uint32_t tag = w->tag;
+    list_remove(bk, w);
+    word_set(mutex, tag | (others ? HANDLE_WAIT_MASK : 0));
+    hos_thread_wake(t);
 }
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
 #include <emmintrin.h>
 static int spin_for_release(uint64_t mutex, uint32_t held) {
-    const int64_t limit = hos_spin_ns();
+    /* a counted spin, not a timed one: a clock call on every miss cost more than the wait it saved.
+       HOS_SPIN_US still says how long to spin, in microseconds' worth of pauses (~64 a pause cycle); 0: no spin */
+    static int iters = -1;
+    if (iters < 0) {
+        const char *e = getenv("HOS_SPIN_US");
+        const int us = e ? atoi(e) : 1;
+        iters = us <= 0 ? 0 : us > 1000 ? 64000 : us * 64;
+    }
+    if (!iters) return 0;
     static int misses[256], tries[256];
     const unsigned slot = (unsigned)(mutex >> 3 ^ mutex >> 11) & 255;
     const int m = __atomic_load_n(&misses[slot], __ATOMIC_RELAXED);
-    if (limit <= 0 || (m >= 4 && (__atomic_add_fetch(&tries[slot], 1, __ATOMIC_RELAXED) & 31))) return 0;
-    const int64_t end = hos_now_ns() + limit;
-    for (;;) {
-        for (int i = 0; i < 16; i++) {
-            if (word_get(mutex) != held) {
-                __atomic_store_n(&misses[slot], 0, __ATOMIC_RELAXED);
-                return 1;
-            }
-            _mm_pause();
+    if (m >= 4 && (__atomic_add_fetch(&tries[slot], 1, __ATOMIC_RELAXED) & 31)) return 0;
+    for (int i = 0; i < 64; i++) {
+        if (word_get(mutex) != held) {
+            __atomic_store_n(&misses[slot], 0, __ATOMIC_RELAXED);
+            return 1;
         }
-        if (hos_now_ns() >= end) {
-            if (m < 4) __atomic_store_n(&misses[slot], m + 1, __ATOMIC_RELAXED);
-            return 0;
-        }
+        _mm_pause();
     }
+    if (m < 4) __atomic_store_n(&misses[slot], m + 1, __ATOMIC_RELAXED);
+    return 0;
 }
 #else
 static int spin_for_release(uint64_t mutex, uint32_t held) { (void)mutex; (void)held; return 0; }
@@ -140,14 +173,15 @@ static int spin_for_release(uint64_t mutex, uint32_t held) { (void)mutex; (void)
 static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
     HosThread *self = hos_self();
     if (spin_for_release(mutex, owner | HANDLE_WAIT_MASK)) return 0;
-    AcquireSRWLockExclusive(&klock);
+    SvcBucket *bk = &buckets[bucket_idx(mutex)];
+    AcquireSRWLockExclusive(&bk->lk);
     if (word_get(mutex) != (owner | HANDLE_WAIT_MASK)) {   /* released meanwhile: let user mode retry */
-        ReleaseSRWLockExclusive(&klock);
+        ReleaseSRWLockExclusive(&bk->lk);
         return 0;
     }
-    if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
-    waiters[nwaiters++] = (Waiter){self, mutex, 0, tag, 0};
-    ReleaseSRWLockExclusive(&klock);
+    Waiter w = {self, mutex, 0, tag, 0, NULL, NULL};
+    list_push(bk, &w);
+    ReleaseSRWLockExclusive(&bk->lk);
     int to;
     hos_thread_wait(self, -1, &to);   /* woken once release_locked made us the owner */
     return 0;
@@ -155,93 +189,99 @@ static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
 
 /* svcArbitrateUnlock(mutex address) */
 static uint32_t arbitrate_unlock(uint64_t mutex) {
-    AcquireSRWLockExclusive(&klock);
-    release_locked(mutex);
-    ReleaseSRWLockExclusive(&klock);
+    SvcBucket *bk = &buckets[bucket_idx(mutex)];
+    AcquireSRWLockExclusive(&bk->lk);
+    release_locked(bk, mutex);
+    ReleaseSRWLockExclusive(&bk->lk);
     return 0;
 }
 
 /* svcWaitProcessWideKeyAtomic(mutex address, key address, own tag, timeout ns) */
 static uint32_t wait_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&klock);
-    /* The key says "a waiter" before the mutex is released (as Horizon's kernel does): user mode signals only when it
-       reads a nonzero key, so a signaller that took the mutex the moment it was free saw 0, skipped the signal, and
-       this thread slept forever (the rare stall while loading: a thread on a key of 1 with its mutex free). */
+    const unsigned mb = bucket_idx(mutex), kb = bucket_idx(key);
+    bucket_lock2(mb, kb);
     word_set(key, 1);
-    if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
-    waiters[nwaiters++] = (Waiter){self, mutex, key, tag, 1};
-    release_locked(mutex);
-    ReleaseSRWLockExclusive(&klock);
+    Waiter w = {self, mutex, key, tag, 1, NULL, NULL};
+    list_push(&buckets[kb], &w);
+    release_locked(&buckets[mb], mutex);
+    bucket_unlock2(mb, kb);
     int to;
     hos_thread_wait(self, timeout, &to);
     if (!to) return 0;
-    AcquireSRWLockExclusive(&klock);
-    int i = find_thread(self);
-    if (i >= 0 && waiters[i].on_key) {   /* still waiting on the key: a real timeout; user mode relocks */
-        remove_waiter(i);
-        ReleaseSRWLockExclusive(&klock);
+    AcquireSRWLockExclusive(&buckets[kb].lk);
+    if (w.on_key == 1 && (w.prev || w.next || buckets[kb].head == &w)) {   /* still waiting on the key: real timeout */
+        list_remove(&buckets[kb], &w);
+        ReleaseSRWLockExclusive(&buckets[kb].lk);
         return R_TIMED_OUT;
     }
-    ReleaseSRWLockExclusive(&klock);
-    /* signaled meanwhile: either moved to the mutex queue (wait for the hand-over) or already handed the mutex
-       (the wake is pending); both end with one wake-up */
+    ReleaseSRWLockExclusive(&buckets[kb].lk);
     hos_thread_wait(self, -1, &to);
     return 0;
 }
 
 /* svcSignalProcessWideKey(key address, count): count <= 0 wakes all */
 static void signal_key(uint64_t key, int32_t count) {
-    AcquireSRWLockExclusive(&klock);
-    for (int n = 0; count <= 0 || n < count; n++) {
-        int others, i = best_waiter(key, 1, &others);
-        if (i < 0) break;
-        Waiter *w = &waiters[i];
-        /* The owner may unlock (owner -> 0) and other threads lock (0 -> them) in user mode meanwhile: a plain store
-           here once left the word naming a thread that had unlocked it (its next Lock aborted: "locked by the
-           current thread"), or gave a free mutex to two threads. */
+    const unsigned kb = bucket_idx(key);
+    SvcBucket *kbk = &buckets[kb];
+    for (int n = 0; count <= 0 || n < count; ) {
+        AcquireSRWLockExclusive(&kbk->lk);
+        int others;
+        Waiter *w = best_waiter(kbk, key, 1, &others);
+        if (!w) { ReleaseSRWLockExclusive(&kbk->lk); break; }
+        const uint64_t mutex = w->mutex;
+        const unsigned mb = bucket_idx(mutex);
+        if (mb != kb) {
+            ReleaseSRWLockExclusive(&kbk->lk);
+            bucket_lock2(kb, mb);
+            w = best_waiter(kbk, key, 1, &others);
+            if (!w || w->mutex != mutex) { bucket_unlock2(kb, mb); continue; }
+        }
+        n++;
+        SvcBucket *mbk = &buckets[mb];
         for (;;) {
-            const uint32_t cur = word_get(w->mutex);
+            const uint32_t cur = word_get(mutex);
             if (cur == 0) {                           /* mutex free: it is theirs */
-                if (!word_cas(w->mutex, 0, w->tag)) continue;
+                if (!word_cas(mutex, 0, w->tag)) continue;
                 HosThread *t = w->t;
-                remove_waiter(i);
+                list_remove(kbk, w);
                 hos_thread_wake(t);
             } else {                                  /* queue on the mutex */
-                if (!(cur & HANDLE_WAIT_MASK) && !word_cas(w->mutex, cur, cur | HANDLE_WAIT_MASK)) continue;
+                if (!(cur & HANDLE_WAIT_MASK) && !word_cas(mutex, cur, cur | HANDLE_WAIT_MASK)) continue;
+                list_remove(kbk, w);
                 w->on_key = 0;
+                list_push(mbk, w);
             }
             break;
         }
+        bucket_unlock2(kb, mb);
     }
+    AcquireSRWLockExclusive(&kbk->lk);
     int others;
-    if (best_waiter(key, 1, &others) < 0) word_set(key, 0);
-    ReleaseSRWLockExclusive(&klock);
+    if (!best_waiter(kbk, key, 1, &others)) word_set(key, 0);
+    ReleaseSRWLockExclusive(&kbk->lk);
 }
 
-/* ---- (hookshot) the address arbiter: svcWaitForAddress / svcSignalToAddress -----------------------------------
-   OoT's SDK (22.2.8) uses them; MKW's never did. Waiters share the table above (on_key 2, key = the address) and klock,
-   so the condition check and the sleep are atomic against a signal, as in Horizon's KAddressArbiter (mesosphere).
-   Wait types: 0 WaitIfLessThan, 1 DecrementAndWaitIfLessThan, 2 WaitIfEqual (32-bit), 3 WaitIfEqual64 (21.0+).
-   Signal types: 0 Signal, 1 SignalAndIncrementIfEqual, 2 SignalAndModifyByWaitingCountIfEqual. */
 #define R_INVALID_STATE 0xFA01   /* svc::ResultInvalidState: the value did not match */
-static int addr_waiters(uint64_t addr) {
+static int addr_waiters(SvcBucket *bk, uint64_t addr) {
     int n = 0;
-    for (int i = 0; i < nwaiters; i++) if (waiters[i].on_key == 2 && waiters[i].key == addr) n++;
+    for (Waiter *w = bk->head; w; w = w->next) if (w->on_key == 2 && w->key == addr) n++;
     return n;
 }
-static void wake_address_locked(uint64_t addr, int32_t count) {
+static void wake_address_locked(SvcBucket *bk, uint64_t addr, int32_t count) {
     for (int n = 0; count <= 0 || n < count; n++) {
-        int others, i = best_waiter(addr, 2, &others);
-        if (i < 0) break;
-        HosThread *t = waiters[i].t;
-        remove_waiter(i);
+        int others;
+        Waiter *w = best_waiter(bk, addr, 2, &others);
+        if (!w) break;
+        HosThread *t = w->t;
+        list_remove(bk, w);
         hos_thread_wake(t);
     }
 }
 static uint32_t wait_address(uint64_t addr, uint32_t type, uint64_t value, int64_t timeout) {
     HosThread *self = hos_self();
-    AcquireSRWLockExclusive(&klock);
+    SvcBucket *bk = &buckets[bucket_idx(addr)];
+    AcquireSRWLockExclusive(&bk->lk);
     int wait;
     switch (type) {
     case 0: wait = (int32_t)word_get(addr) < (int32_t)value; break;
@@ -257,67 +297,71 @@ static uint32_t wait_address(uint64_t addr, uint32_t type, uint64_t value, int64
     case 2: wait = (int32_t)word_get(addr) == (int32_t)value; break;
     case 3: wait = __atomic_load_n((uint64_t *)GP(addr), __ATOMIC_SEQ_CST) == value; break;
     default:
-        ReleaseSRWLockExclusive(&klock);
+        ReleaseSRWLockExclusive(&bk->lk);
         hos_log("svcWaitForAddress: arbitration type %u", type);
         return R_INVALID_ENUM;
     }
-    if (!wait) { ReleaseSRWLockExclusive(&klock); return R_INVALID_STATE; }
-    if (timeout == 0) { ReleaseSRWLockExclusive(&klock); return R_TIMED_OUT; }
-    if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
-    waiters[nwaiters++] = (Waiter){self, 0, addr, 0, 2};
-    ReleaseSRWLockExclusive(&klock);
+    if (!wait) { ReleaseSRWLockExclusive(&bk->lk); return R_INVALID_STATE; }
+    if (timeout == 0) { ReleaseSRWLockExclusive(&bk->lk); return R_TIMED_OUT; }
+    Waiter w = {self, 0, addr, 0, 2, NULL, NULL};
+    list_push(bk, &w);
+    ReleaseSRWLockExclusive(&bk->lk);
     int to;
     hos_thread_wait(self, timeout, &to);
     if (!to) return 0;
-    AcquireSRWLockExclusive(&klock);
-    int i = find_thread(self);
-    if (i >= 0 && waiters[i].on_key == 2) {   /* still queued: a real timeout */
-        remove_waiter(i);
-        ReleaseSRWLockExclusive(&klock);
+    AcquireSRWLockExclusive(&bk->lk);
+    if (w.prev || w.next || bk->head == &w) {   /* still queued: a real timeout */
+        list_remove(bk, &w);
+        ReleaseSRWLockExclusive(&bk->lk);
         return R_TIMED_OUT;
     }
-    ReleaseSRWLockExclusive(&klock);
+    ReleaseSRWLockExclusive(&bk->lk);
     hos_thread_wait(self, -1, &to);   /* signaled meanwhile: take the pending wake-up */
     return 0;
 }
 static uint32_t signal_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
-    AcquireSRWLockExclusive(&klock);
+    SvcBucket *bk = &buckets[bucket_idx(addr)];
+    AcquireSRWLockExclusive(&bk->lk);
     uint32_t r = 0;
     if (type == 1) {
         if (!word_cas(addr, (uint32_t)value, (uint32_t)value + 1)) r = R_INVALID_STATE;
     } else if (type == 2) {
-        /* the new value from the number of waiters, as mesosphere's KAddressArbiter computes it */
-        const int n = addr_waiters(addr);
+        const int n = addr_waiters(bk, addr);
         int32_t nv;
         if (count <= 0) nv = n > 0 ? value - 2 : value + 1;
         else if (n > 0) {
-            const int more = n - 1 < count + 1 ? n - 1 : count + 1;   /* the waiters after the first, capped */
+            const int more = n - 1 < count + 1 ? n - 1 : count + 1;
             nv = more == 0 ? value + 1 : more <= count ? value - 1 : value;
         } else nv = value + 1;
         if (!word_cas(addr, (uint32_t)value, (uint32_t)nv)) r = R_INVALID_STATE;
     } else if (type != 0) {
-        ReleaseSRWLockExclusive(&klock);
+        ReleaseSRWLockExclusive(&bk->lk);
         hos_log("svcSignalToAddress: signal type %u", type);
         return R_INVALID_ENUM;
     }
-    if (!r) wake_address_locked(addr, count);
-    ReleaseSRWLockExclusive(&klock);
+    if (!r) wake_address_locked(bk, addr, count);
+    ReleaseSRWLockExclusive(&bk->lk);
     return r;
 }
 
-/* Every thread waiting in the kernel's locks and condition variables, with the words they wait on (printed with the
-   thread stacks at HOS_EXIT_AFTER: who holds what in a hang). */
 void hos_kernel_dump(void) {
-    AcquireSRWLockExclusive(&klock);
-    hos_log("kernel: %d threads waiting", nwaiters);
-    for (int i = 0; i < nwaiters; i++) {
-        const Waiter *w = &waiters[i];
-        hos_log("kernel:   %s (tag %#x) on %s %#llx: mutex %#llx = %#x, key %#llx = %#x", hos_thread_name(w->t), w->tag,
-                w->on_key ? "key" : "mutex", (unsigned long long)(w->on_key ? w->key : w->mutex),
-                (unsigned long long)w->mutex, w->mutex ? word_get(w->mutex) : 0, (unsigned long long)w->key,
-                w->key ? word_get(w->key) : 0);
+    int total = 0;
+    for (int b = 0; b < SVC_BUCKETS; b++) {
+        AcquireSRWLockExclusive(&buckets[b].lk);
+        for (Waiter *w = buckets[b].head; w; w = w->next) total++;
+        ReleaseSRWLockExclusive(&buckets[b].lk);
     }
-    ReleaseSRWLockExclusive(&klock);
+    hos_log("kernel: %d threads waiting", total);
+    for (int b = 0; b < SVC_BUCKETS; b++) {
+        AcquireSRWLockExclusive(&buckets[b].lk);
+        for (Waiter *w = buckets[b].head; w; w = w->next) {
+            hos_log("kernel:   %s (tag %#x) on %s %#llx: mutex %#llx = %#x, key %#llx = %#x", hos_thread_name(w->t), w->tag,
+                    w->on_key ? "key" : "mutex", (unsigned long long)(w->on_key ? w->key : w->mutex),
+                    (unsigned long long)w->mutex, w->mutex ? word_get(w->mutex) : 0, (unsigned long long)w->key,
+                    w->key ? word_get(w->key) : 0);
+        }
+        ReleaseSRWLockExclusive(&buckets[b].lk);
+    }
     void hos_thread_log_handles(void);
     hos_thread_log_handles();
 }

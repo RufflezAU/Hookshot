@@ -3901,7 +3901,10 @@ volatile uint32_t* marker_words = nullptr;
 
 // (RX_VK_CHECKPOINTS=ext: the extension on, no markers: which of the two keeps the device from being lost)
 bool checkpoint_markers() {
-    static const bool on = !getenv("RX_VK_CHECKPOINTS") || strcmp(getenv("RX_VK_CHECKPOINTS"), "ext") != 0;
+    static const bool on = []() {
+        const char* v = getenv("RX_VK_CHECKPOINTS");
+        return v && strcmp(v, "0") != 0 && strcmp(v, "ext") != 0;
+    }();
     return on;
 }
 bool checkpoints_on() {
@@ -3931,10 +3934,17 @@ const char* checkpoint_kind(char c) {
 thread_local uint64_t fallback_payload_address = 0, fallback_records_address = 0;   // (the draw's fallback buffers)
 thread_local uint64_t fallback_indirect_input = 0;
 
+// (a push the last push on this command buffer already made: the same constants, layout and stages, so the state is
+// already what the draw would set. Two draws in a row that differ in nothing but their geometry push none of them:
+// ~5% of the replay's commands)
+static thread_local VkCommandBuffer last_push_cmd = VK_NULL_HANDLE;
+static thread_local VkPipelineLayout last_push_layout = VK_NULL_HANDLE;
+static thread_local VkShaderStageFlags last_push_stages = 0;
+static thread_local uint8_t last_push_data[kPushSize]{};
+
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, uint32_t fallback_first = 0) {
     checkpoint(cmd, p, at ? 'd' : 'c');
     if (!p.uses_push) return;   // (most programs read none: a push a draw was ~5% of the replay's commands)
-    FINE_N(FC_PUSHC, 1);
     uint8_t data[kPushSize]{};
     const float one = 1.0f;
     std::memcpy(data + Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, &one, 4);
@@ -3961,7 +3971,15 @@ void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at, ui
         const float ra[4] = {(float)at->width, (float)at->height, 0.0f, 0.0f};
         std::memcpy(data + Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET, ra, sizeof ra);
     }
+    if (cmd == last_push_cmd && p.layout == last_push_layout && p.push_stages == last_push_stages &&
+        std::memcmp(last_push_data, data, kPushSize) == 0)
+        return;
+    FINE_N(FC_PUSHC, 1);
     vkCmdPushConstants(cmd, p.layout, p.push_stages, 0, kPushSize, data);
+    last_push_cmd = cmd;
+    last_push_layout = p.layout;
+    last_push_stages = p.push_stages;
+    std::memcpy(last_push_data, data, kPushSize);
 }
 
 } // namespace
@@ -4935,6 +4953,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     if (!r.pool) {
         r.pool = make_pool();
     } else {
+        last_push_cmd = VK_NULL_HANDLE;
         vkResetDescriptorPool(dev.device, r.pool, 0);
         for (VkDescriptorPool p : r.extra) vkDestroyDescriptorPool(dev.device, p, nullptr);
         r.extra.clear();
@@ -6069,7 +6088,8 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier2(cmd, &di);
-    std::vector<VkBufferCopy> regions(n);
+    static thread_local std::vector<VkBufferCopy> regions;
+    regions.resize(n);
     for (uint32_t i = 0; i < n; i++) regions[i] = {args.offset + (uint64_t)i * stride + 4 * word, off + (uint64_t)i * 12, 4};
     vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions.data());
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -6988,7 +7008,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         trace_tex_hit = nullptr, trace_tex_mask = 0;
         build_descriptors(s, p);   // (textures first used here are uploaded by the recording's upload command buffer)
         FINE_N(FC_WRITES, (int64_t)dw().writes.size());
-        static std::string last_logged;
+        static thread_local std::string last_logged;
         if (dump_on()) {
             char head[256];
             int hn = snprintf(head, sizeof head, "prog %016llx %ux%u:", (unsigned long long)p.key, at.width, at.height);
@@ -7369,9 +7389,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (d.indirect || d.count < 4) SKIP_HERE();
         if (d.count > (1 << 24)) SKIP_HERE();   // (hookshot: 4M quads at most; the game's count sized host vectors of up to 16 GB)
         const uint32_t quads = (uint32_t)d.count / 4, unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
-        std::vector<uint32_t> src(d.indexed ? (size_t)quads * 4 : 0);
+        static thread_local std::vector<uint32_t> src;
+        src.resize(d.indexed ? (size_t)quads * 4 : 0);
         if (d.indexed) {
-            std::vector<uint8_t> raw((size_t)quads * 4 * unit);
+            static thread_local std::vector<uint8_t> raw;
+            raw.resize((size_t)quads * 4 * unit);
             if (!memory_read_as_submitted(d.ibuf, raw.data(), raw.size())) SKIP_HERE();
             for (size_t i = 0; i < src.size(); i++) {
                 uint32_t v = 0;

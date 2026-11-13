@@ -55,14 +55,22 @@ LOOKUP = "    uint32_t a = (uint32_t)addr, lo = 0, hi = a64_fn_count;"
 MARK_NATIVE = r"""extern uint8_t a64_dirty[1u << 20];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
-#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[(uint32_t)(a) >> 12], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[(uint32_t)((a) + (n) - 1) >> 12], 1, __ATOMIC_RELEASE))"""
+#define A64_MARK1(a) __atomic_store_n(&a64_dirty[(uint32_t)(a) >> 12], 1, __ATOMIC_RELEASE)
+#define A64_MARK(a, n) do { \
+    A64_MARK1(a); \
+    if (__builtin_expect((((uint32_t)(a) & 0xFFFu) + (uint32_t)(n) - 1u) >= 4096u, 0)) \
+        A64_MARK1((a) + (n) - 1); \
+} while (0)"""
 MARK_NATIVE_64 = r"""extern uint8_t a64_dirty[A64_DIRTY_PAGES];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
 #define A64_DIRTY_AT(a) (((uint64_t)(a) >> 12) & (A64_DIRTY_PAGES - 1))
-#define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))"""
+#define A64_MARK1(a) __atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE)
+#define A64_MARK(a, n) do { \
+    A64_MARK1(a); \
+    if (__builtin_expect((((uint32_t)(a) & 0xFFFu) + (uint32_t)(n) - 1u) >= 4096u, 0)) \
+        A64_MARK1((a) + (n) - 1); \
+} while (0)"""
 
 SUBST = {
     "a64.h": [

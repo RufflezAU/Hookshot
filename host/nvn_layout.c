@@ -14,7 +14,7 @@
 
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
 
-static fmt_t fmt_of(int f) {
+static fmt_t fmt_of_slow(int f) {
     static const uint8_t astc[14][2] = {{4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},{10,5},{10,6},{10,8},{10,10},{12,10},{12,12}};
     if (f >= 0x79 && f <= 0x94) { int k = (f - 0x79) % 14; return (fmt_t){16, astc[k][0], astc[k][1]}; }
     if (f >= 0x41 && f <= 0x50) {   // DXT / RGTC / BPTC: 4×4 blocks
@@ -32,6 +32,21 @@ static fmt_t fmt_of(int f) {
     for (unsigned i = 0; i < sizeof r / sizeof *r; i++)
         if (f >= r[i].lo && f <= r[i].hi) return (fmt_t){r[i].bpb, 1, 1};
     return (fmt_t){0, 1, 1};
+}
+
+static fmt_t fmt_of(int f) {
+    static fmt_t tbl[0x9D];
+    static atomic_int init_state;
+    if (__builtin_expect(atomic_load_explicit(&init_state, memory_order_acquire) != 2, 0)) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&init_state, &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+            for (int i = 0; i < 0x9D; i++) tbl[i] = fmt_of_slow(i);
+            atomic_store_explicit(&init_state, 2, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&init_state, memory_order_acquire) != 2) {}
+        }
+    }
+    return ((unsigned)f < 0x9Du) ? tbl[f] : (fmt_t){0, 1, 1};
 }
 
 int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.bw; if (bh) *bh = t.bh; return t.bpb; }
