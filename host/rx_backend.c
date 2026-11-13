@@ -142,7 +142,11 @@ static int64_t collect_in(const uint64_t (*ranges)[2], int nranges, uint32_t **p
 }
 static int64_t host_collect(uint32_t **pages) {
     static int scoped = -1;
+#if defined(_WIN32)   /* (armed by the commit-on-touch handler; POSIX has mprotect but no handler to test the write) */
     if (scoped < 0) scoped = getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0;
+#else
+    if (scoped < 0) scoped = 0;
+#endif
     if (scoped) return hos_drain_dirty_pages(pages, 1);
     static uint64_t (*ranges)[2];
     if (!ranges) ranges = malloc(sizeof *ranges * 4096);
@@ -152,22 +156,30 @@ static int64_t host_collect(uint32_t **pages) {
    whole collection takes) */
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) {
     static int scoped = -1;
+#if defined(_WIN32)   /* (armed by the commit-on-touch handler; POSIX has mprotect but no handler to test the write) */
     if (scoped < 0) scoped = getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0;
+#else
+    if (scoped < 0) scoped = 0;
+#endif
     if (scoped) return hos_drain_dirty_pages(pages, 1);
     return collect_in(ranges, n, pages);
 }
 #else
 static int64_t host_collect(uint32_t **pages) {
+#if defined(_WIN32)
     if (getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0)
         return hos_drain_dirty_pages(pages, 1);
+#endif
     int64_t n = -1;
     *pages = rx_collect_written(&n);
     return n;
 }
 static int64_t host_collect_in(const uint64_t (*ranges)[2], int n, uint32_t **pages) {
     (void)ranges, (void)n;
+#if defined(_WIN32)
     if (getenv("RX_SCOPED_GUARD") && atoi(getenv("RX_SCOPED_GUARD")) != 0)
         return hos_drain_dirty_pages(pages, 1);
+#endif
     *pages = 0;
     return 0;
 }

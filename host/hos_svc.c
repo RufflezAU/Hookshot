@@ -73,11 +73,11 @@ typedef struct Waiter {
     int on_key;
     struct Waiter *prev, *next;
 } Waiter;
-typedef struct _Alignas(64) {
+typedef struct {
     SRWLOCK lk;
     Waiter *head, *tail;
 } SvcBucket;
-static SvcBucket buckets[SVC_BUCKETS];
+static _Alignas(64) SvcBucket buckets[SVC_BUCKETS];   /* (a bucket a cache line: two threads on two mutexes do not fight for one) */
 
 static unsigned bucket_idx(uint64_t addr) { return (unsigned)((addr >> 3) ^ (addr >> 11) ^ (addr >> 19)) & (SVC_BUCKETS - 1); }
 static void bucket_lock2(unsigned a, unsigned b) {

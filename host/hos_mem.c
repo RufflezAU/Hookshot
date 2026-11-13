@@ -231,14 +231,22 @@ static void guard_ensure(void) {
     if (__atomic_load_n(&guard_state, __ATOMIC_ACQUIRE)) return;
     AcquireSRWLockExclusive(&guard_lk);
     if (!guard_state) {
+#if defined(_WIN32)
         uint8_t *p = (uint8_t *)VirtualAlloc(NULL, (size_t)(HOS_GUEST_SPACE >> 12), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        uint8_t *p = (uint8_t *)calloc(1, (size_t)(HOS_GUEST_SPACE >> 12));   /* (zero: nothing guarded yet) */
+#endif
         __atomic_store_n(&guard_state, p, __ATOMIC_RELEASE);
     }
     ReleaseSRWLockExclusive(&guard_lk);
 }
 static int guard_protect_range(uint64_t page0, uint64_t count, int ro) {
+#if defined(_WIN32)
     DWORD old;
     return VirtualProtect(GP(page0 << 12), (SIZE_T)(count << 12), ro ? PAGE_READONLY : PAGE_READWRITE, &old) != 0;
+#else
+    return mprotect(GP(page0 << 12), (size_t)(count << 12), ro ? PROT_READ : (PROT_READ | PROT_WRITE)) == 0;
+#endif
 }
 void hos_guard_pages(uint64_t guest, uint64_t size) {
     if (!size || guest >= HOS_GUEST_SPACE) return;
