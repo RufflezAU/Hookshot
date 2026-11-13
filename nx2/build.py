@@ -1177,6 +1177,14 @@ def main():
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
+        # (a local build: the C++ runtime's headers, for a sysroot that has none of its own. HOOKSHOT_CXX_INCLUDE is the
+        # installation's include directory, in gcc's layout: include/c++/<version> and include/<arch>/c++/<version>)
+        cxx_flags = []
+        if os.environ.get("HOOKSHOT_CXX_INCLUDE"):
+            for sub in ("c++/14", "c++/14/backward", "x86_64-linux-gnu/c++/14"):
+                d = os.path.join(os.environ["HOOKSHOT_CXX_INCLUDE"], *sub.split("/"))
+                if os.path.isdir(d):
+                    cxx_flags += ["-isystem", d]
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
@@ -1193,7 +1201,7 @@ def main():
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
             "-I" + os.path.join(vk_headers, "include"), "-I" + os.path.join(vma_headers, "include"),
             "-I" + vk, "-I" + gen_dir,
-            "-I" + os.path.join(kit.ROOT, "third_party", "zbic")]
+            "-I" + os.path.join(kit.ROOT, "third_party", "zbic")] + cxx_flags
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
@@ -1406,6 +1414,7 @@ def main():
         t = time.time()
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + ["-fuse-ld=lld", "-shared", "-o", vdll] + \
+                (["-L" + os.environ["HOOKSHOT_CXX_LIB"]] if os.environ.get("HOOKSHOT_CXX_LIB") else []) + \
                 linker("-Map=" + vdll + ".map") + ["-Wl,-Bsymbolic", "-Wl,--gc-sections", "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:

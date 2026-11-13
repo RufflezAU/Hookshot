@@ -9,6 +9,7 @@
    layer-faces (a multiple of 6), and linear textures are sized in pixel rows, block-compressed ones too (MacNativeGames
    3c482a7, found against the original driver under emulation: nxnative PR 11). */
 #include "../gpu/render/rx_nvn.h"
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
