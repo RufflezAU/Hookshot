@@ -143,11 +143,13 @@ static void release_locked(SvcBucket *bk, uint64_t mutex) {
 #include <emmintrin.h>
 static int spin_for_release(uint64_t mutex, uint32_t held) {
     /* a counted spin, not a timed one: a clock call on every miss cost more than the wait it saved.
-       HOS_SPIN_US still says how long to spin, in microseconds' worth of pauses (~64 a pause cycle); 0: no spin */
+       HOS_SPIN_US still says how long to spin, in microseconds' worth of pauses (~64 a pause cycle); 0: no spin.
+       The default is the 20 us this build has always spun: at 1 us (64 pauses) the Deck re-entered the kernel
+       for every contended mutex and the frame went 36 -> 45 ms (measured, both halves of the frame slower). */
     static int iters = -1;
     if (iters < 0) {
         const char *e = getenv("HOS_SPIN_US");
-        const int us = e ? atoi(e) : 1;
+        const int us = e ? atoi(e) : 20;
         iters = us <= 0 ? 0 : us > 1000 ? 64000 : us * 64;
     }
     if (!iters) return 0;
