@@ -688,8 +688,8 @@ static const NameSpec *match_name_spec(const NameSpec *s, int n, const char *nam
    the core, and the same for every core of a CPU of one kind (the last core, as before). Only with 4+ cores of the
    fastest kind (8+ logical processors always have them on a CPU of one kind): a laptop's 2 performance cores and 8
    efficiency ones (i5-1235U) would keep one of the two from the game; then none is kept. The calling thread's
-   processor group's cores: the masks the affinity calls take are its group's. On Linux the same choice from
-   /sys/devices/cpu_core/cpus (Intel's hybrid CPUs; last_fastest_core below); without that file, the last core, as before. */
+   processor group's cores: the masks the affinity calls take are its group's. Windows only: Linux keeps the last core
+   of all, and only for the replay thread (hos_reserved_cpus). */
 /* (hookshot) The cores that share the largest L3, on a CPU whose cores do not all share one of the same size: AMD's X3D CPUs
    with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D) have the 3D V-Cache on one CCD only (96 MB against 32 MB). Windows
    moves a game there only when its Game Bar knows the program as a game; this one it does not know, so its threads ran on
@@ -1002,6 +1002,20 @@ uint64_t hos_reserved_cpus(void) {
         if (cores) {
             mask = fast;
             hos_log("vk: reserved core mask (hybrid, /sys/devices/cpu_core): %#llx (%d cores)", (unsigned long long)mask, cores);
+            return mask;
+        }
+    }
+#else
+    /* Linux: kept only when the replay thread is there to use it (RX_VK_ASYNC=1). The synchronous replay, the default,
+       runs on the game's thread that submits, and its move onto the kept core is Windows only (vk_replay.cpp
+       replay_pin_mask), so nothing of the game's ran on that core: its threads are pinned off it here, and a thread made
+       by one of them has its maker's processors. On a Steam Deck that is one of four cores, with the frame bound by the
+       CPU. HOS_RESERVE_CORE=1: kept all the same. */
+    {
+        const char *async = getenv("RX_VK_ASYNC"), *keep = getenv("HOS_RESERVE_CORE");
+        if (!(async && atoi(async) != 0) && !(keep && atoi(keep) != 0)) {
+            hos_log("threads: no core is kept from the game's threads: there is no replay thread to use it "
+                    "(HOS_RESERVE_CORE=1: the last core kept all the same)");
             return mask;
         }
     }

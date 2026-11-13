@@ -86,20 +86,29 @@ static struct timespec rel_ms(DWORD ms) {
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     return ts;
 }
+/* A wake with nobody asleep is two memory operations and no system call, as on Windows. The game signals events, queues
+   and semaphores thousands of times a frame, mostly while their waiters still spin (nn_os_sync.c spin_until_set) or run,
+   and each of those wakes was a futex call.
+   No wake-up is lost: a waiter counts itself, then reads the sequence, both before it lets its lock go; a waker changes
+   what the waiter waits for under that lock, so after the waiter let it go, then raises the sequence and reads the
+   count. It sees the waiter, and the waiter is asleep on the old sequence or finds it changed. (A wake that comes
+   before the waiter has its lock is lost on Windows too.) */
 void WakeConditionVariable(CONDITION_VARIABLE *cv) {
     __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
-    futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL);
+    if (__atomic_load_n(&cv->waiters, __ATOMIC_SEQ_CST)) futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL);
 }
 void WakeAllConditionVariable(CONDITION_VARIABLE *cv) {
     __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
-    futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
+    if (__atomic_load_n(&cv->waiters, __ATOMIC_SEQ_CST)) futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
 }
 static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), void (*relock)(void *, ULONG), void *l, ULONG flags) {
+    __atomic_add_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     const uint32_t seq = __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST);
     unlock(l);
     struct timespec ts = rel_ms(ms);
     const long r = futex(&cv->seq, FUTEX_WAIT_PRIVATE, seq, ms == INFINITE ? NULL : &ts);
     const int timed_out = r == -1 && errno == ETIMEDOUT;
+    __atomic_sub_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     relock(l, flags);
     if (timed_out) { last_error = ERROR_TIMEOUT; return FALSE; }
     return TRUE;

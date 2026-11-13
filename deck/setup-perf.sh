@@ -15,6 +15,14 @@
 #   2. A systemd unit that sets governor=performance and EPP=performance at boot, so the game does not depend on
 #      anything at launch. Remove it with: sudo systemctl disable --now hookshot-perf.service
 #
+# It also lets the game open /dev/udmabuf (step 3). With it the game's memory reaches the GPU as dma-bufs over the game's
+# own pages. Without it the memory is imported as host pointers, and amdgpu looks up every page of those again at each
+# command submission: about 1 ms a submission on this Deck, several times a frame, inside the frame's replay. The device
+# normally belongs to root and the kvm group, which the deck user is not in; a udev rule gives it to the user's own
+# group instead, the access the kvm group already has. Where the user could open it already, nothing changes. The game's log says which it got: "mem: guest memory stays
+# host-pointer imports" or "vk: dma-bufs of at most ...". Remove it with:
+#   sudo rm /etc/udev/rules.d/71-hookshot-udmabuf.rules /etc/modules-load.d/hookshot-udmabuf.conf
+#
 # /etc on SteamOS survives updates for a while and is reverted by a major OS upgrade; rerun this if it comes back.
 set -e
 [ "$(id -u)" = 0 ] || { echo "run me with sudo"; exit 1; }
@@ -45,10 +53,26 @@ EOF
 systemctl daemon-reload
 systemctl enable --now hookshot-perf.service
 
-echo "3. what it is now"
+echo "3. the game's memory shared with the GPU without a copy (/dev/udmabuf)"
+modprobe udmabuf 2>/dev/null || true
+if [ -e /dev/udmabuf ]; then
+    USER_GROUP=$(id -gn "$USER_NAME")
+    printf 'KERNEL=="udmabuf", GROUP="%s", MODE="0660"\n' "$USER_GROUP" > /etc/udev/rules.d/71-hookshot-udmabuf.rules
+    # (a loadable module is loaded at boot too; built into the kernel, it is always there)
+    if [ -e /sys/module/udmabuf/initstate ]; then echo udmabuf > /etc/modules-load.d/hookshot-udmabuf.conf; fi
+    udevadm control --reload 2>/dev/null || true
+    # (now, without waiting for the next boot)
+    chgrp "$USER_GROUP" /dev/udmabuf && chmod 0660 /dev/udmabuf
+    echo "   $(ls -l /dev/udmabuf)"
+else
+    echo "   no /dev/udmabuf on this kernel; skipping (the game keeps host-pointer imports)"
+fi
+
+echo "4. what it is now"
 for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do printf '%s ' "$(cat "$c")"; done; echo
 echo "   scale (first core): $(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq) / 1000 )) MHz requested, ceiling $(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq) / 1000 )) MHz"
 
 echo
 echo "done. Log out and back in (or reboot) so the group membership applies, then play."
 echo "to undo:  sudo systemctl disable --now hookshot-perf.service && sudo gpasswd -d $USER_NAME gamemode"
+echo "          sudo rm -f /etc/udev/rules.d/71-hookshot-udmabuf.rules /etc/modules-load.d/hookshot-udmabuf.conf"
