@@ -74,10 +74,12 @@ typedef struct Waiter {
     struct Waiter *prev, *next;
 } Waiter;
 typedef struct {
-    SRWLOCK lk;
+    /* (the lock a cache line of its own: the member's alignment pads the struct to 64 bytes, so no two
+       buckets share one and two threads on unrelated mutexes do not write each other's line) */
+    _Alignas(64) SRWLOCK lk;
     Waiter *head, *tail;
 } SvcBucket;
-static _Alignas(64) SvcBucket buckets[SVC_BUCKETS];   /* (a bucket a cache line: two threads on two mutexes do not fight for one) */
+static SvcBucket buckets[SVC_BUCKETS];
 
 static unsigned bucket_idx(uint64_t addr) { return (unsigned)((addr >> 3) ^ (addr >> 11) ^ (addr >> 19)) & (SVC_BUCKETS - 1); }
 static void bucket_lock2(unsigned a, unsigned b) {
