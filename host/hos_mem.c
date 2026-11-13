@@ -221,7 +221,15 @@ int hos_heap_size_fits(uint64_t size) {
 
 /* ---- Scoped hardware page-guard write tracking (replaces per-store A64_MARK) --------------------------------- */
 #define GUARD_RING_CAP (1u << 16)
+#if defined(_WIN32)
 static SRWLOCK guard_lk = SRWLOCK_INIT;
+#define GUARD_LOCK() AcquireSRWLockExclusive(&guard_lk)
+#define GUARD_UNLOCK() ReleaseSRWLockExclusive(&guard_lk)
+#else
+static pthread_mutex_t guard_lk = PTHREAD_MUTEX_INITIALIZER;
+#define GUARD_LOCK() pthread_mutex_lock(&guard_lk)
+#define GUARD_UNLOCK() pthread_mutex_unlock(&guard_lk)
+#endif
 static uint8_t *guard_state; /* lazy 1 byte per 4 KB page: 0=unguarded, 1=armed, 2=dirty, 3=unguarding */
 static uint32_t guard_ring[GUARD_RING_CAP];
 static uint32_t guard_head, guard_tail;
@@ -229,7 +237,7 @@ static int guard_overflow;
 
 static void guard_ensure(void) {
     if (__atomic_load_n(&guard_state, __ATOMIC_ACQUIRE)) return;
-    AcquireSRWLockExclusive(&guard_lk);
+    GUARD_LOCK();
     if (!guard_state) {
 #if defined(_WIN32)
         uint8_t *p = (uint8_t *)VirtualAlloc(NULL, (size_t)(HOS_GUEST_SPACE >> 12), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -238,7 +246,7 @@ static void guard_ensure(void) {
 #endif
         __atomic_store_n(&guard_state, p, __ATOMIC_RELEASE);
     }
-    ReleaseSRWLockExclusive(&guard_lk);
+    GUARD_UNLOCK();
 }
 static int guard_protect_range(uint64_t page0, uint64_t count, int ro) {
 #if defined(_WIN32)
@@ -256,7 +264,7 @@ void hos_guard_pages(uint64_t guest, uint64_t size) {
     const uint64_t p0 = guest >> 12;
     uint64_t p1 = ((guest + size - 1) >> 12) + 1;
     if (p1 > (HOS_GUEST_SPACE >> 12)) p1 = HOS_GUEST_SPACE >> 12;
-    AcquireSRWLockExclusive(&guard_lk);
+    GUARD_LOCK();
     uint64_t p = p0;
     while (p < p1) {
         while (p < p1 && __atomic_load_n(&gs[p], __ATOMIC_RELAXED) != 0) p++;
@@ -266,7 +274,7 @@ void hos_guard_pages(uint64_t guest, uint64_t size) {
             for (uint64_t q = run_start; q < p; q++) __atomic_store_n(&gs[q], 1, __ATOMIC_RELEASE);
         }
     }
-    ReleaseSRWLockExclusive(&guard_lk);
+    GUARD_UNLOCK();
 }
 void hos_unguard_pages(uint64_t guest, uint64_t size) {
     uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
@@ -274,7 +282,7 @@ void hos_unguard_pages(uint64_t guest, uint64_t size) {
     const uint64_t p0 = guest >> 12;
     uint64_t p1 = ((guest + size - 1) >> 12) + 1;
     if (p1 > (HOS_GUEST_SPACE >> 12)) p1 = HOS_GUEST_SPACE >> 12;
-    AcquireSRWLockExclusive(&guard_lk);
+    GUARD_LOCK();
     uint64_t p = p0;
     while (p < p1) {
         while (p < p1 && __atomic_load_n(&gs[p], __ATOMIC_RELAXED) == 0) p++;
@@ -288,7 +296,7 @@ void hos_unguard_pages(uint64_t guest, uint64_t size) {
             for (uint64_t q = run_start; q < p; q++) __atomic_store_n(&gs[q], 0, __ATOMIC_RELEASE);
         }
     }
-    ReleaseSRWLockExclusive(&guard_lk);
+    GUARD_UNLOCK();
 }
 int hos_guard_on_write(uint64_t guest) {
     uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
@@ -296,7 +304,7 @@ int hos_guard_on_write(uint64_t guest) {
     const uint64_t p = guest >> 12;
     const uint8_t st = __atomic_load_n(&gs[p], __ATOMIC_ACQUIRE);
     if (st != 1 && st != 3) return 0;
-    AcquireSRWLockExclusive(&guard_lk);
+    GUARD_LOCK();
     const uint8_t cur = __atomic_load_n(&gs[p], __ATOMIC_RELAXED);
     if (cur == 1) {
         guard_protect_range(p, 1, 0);
@@ -307,13 +315,13 @@ int hos_guard_on_write(uint64_t guest) {
             guard_overflow = 1;
         }
     }
-    ReleaseSRWLockExclusive(&guard_lk);
+    GUARD_UNLOCK();
     return 1;
 }
 int64_t hos_drain_dirty_pages(uint32_t **pages, int rearm) {
     uint8_t *gs = __atomic_load_n(&guard_state, __ATOMIC_ACQUIRE);
     if (!gs) { *pages = NULL; return 0; }
-    AcquireSRWLockExclusive(&guard_lk);
+    GUARD_LOCK();
     if (guard_overflow) {
         const uint64_t total = HOS_GUEST_SPACE >> 12;
         uint32_t cap = 1024, n = 0;
@@ -334,7 +342,7 @@ int64_t hos_drain_dirty_pages(uint32_t **pages, int rearm) {
         }
         guard_head = guard_tail;
         guard_overflow = 0;
-        ReleaseSRWLockExclusive(&guard_lk);
+        GUARD_UNLOCK();
         *pages = out;
         return (int64_t)n;
     }
@@ -349,7 +357,7 @@ int64_t hos_drain_dirty_pages(uint32_t **pages, int rearm) {
             else __atomic_store_n(&gs[p], 0, __ATOMIC_RELEASE);
         }
     }
-    ReleaseSRWLockExclusive(&guard_lk);
+    GUARD_UNLOCK();
     *pages = out;
     return (int64_t)n;
 }
