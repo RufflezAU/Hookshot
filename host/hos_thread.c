@@ -48,6 +48,18 @@ struct HosThread {
        switched to a guest fiber */
     Ctx *volatile run_ctx;
     void *host_fiber;
+    /* background threads (bg_gate): the share of a processor it may use, percent (0: not held to one); the event that
+       ends a rest early and whether it rests; the window its use is measured over (processor time and time passed at
+       its start, in bg_usage's unit, and its start and the next look, ns); until when a waiter for its lock lets it
+       run; the log line's counts */
+    int bg_duty;
+    HANDLE bg_wake;
+    volatile int bg_resting;
+    int64_t bg_used0, bg_wall0, bg_from, bg_look;
+    volatile int64_t bg_hurry_until;
+    int64_t bg_st_since, bg_st_rested;
+    int bg_st_rests;
+    volatile int bg_st_hurries;
 };
 
 /* The SDK's own mutexes (InternalCriticalSection) tag a lock word with the owner's handle, read from
@@ -73,6 +85,7 @@ static _Thread_local HosThread *cur;
 static SRWLOCK threads_lock = SRWLOCK_INIT;
 static HosThread *threads[1024];
 static int nthreads;
+static void bg_classify(HosThread *t);   /* (background threads, below) */
 static volatile LONG64 next_id = 0x50;
 
 HosThread *hos_self(void) { return cur; }
@@ -579,6 +592,7 @@ void hos_thread_destroy(HosThread *t) {
     ReleaseSRWLockExclusive(&threads_lock);
     if (t->handle) CloseHandle(t->handle);
     if (t->wake) CloseHandle(t->wake);
+    if (t->bg_wake) CloseHandle(t->bg_wake);
     free(t);
 }
 
@@ -630,6 +644,7 @@ int64_t hos_spin_ns(void) {
 
 void hos_thread_set_name(HosThread *t, const char *name) {
     snprintf(t->name, sizeof t->name, "%s", name);
+    bg_classify(t);   /* (the background threads' share, before the name is used for pinning) */
     __atomic_store_n(&t->serial, serial_name(t->name), __ATOMIC_RELAXED);   /* (atomic: SetThreadName may name another thread) */
     if (t->handle) {
         wchar_t w[48];
@@ -1196,6 +1211,166 @@ static void sleep_ns(int64_t ns, int guest) {
     if (ns > 2000000) Sleep((DWORD)((ns - 1000000) / 1000000));
     while (hos_now_ns() < until) SwitchToThread();
 }
+
+/* ---- background threads ----------------------------------------------------------------------------------------
+   A game thread that uses all the processor time it is given, for work no frame waits on, is held to a share of one
+   processor (its duty, a percentage). OoT's OptimizeChangeBank is the one known (hos_thread_pin has what it does). On
+   the console it runs below the frame's threads and gets the time they leave. A lower host priority does not give
+   that: a host with a logical processor free runs the thread whatever its priority, and the second thread of a core
+   the replay or a job worker runs on is free in that sense, so the thread takes part of that core's speed. (Steam
+   Deck, 4 cores / 8 threads, Hyrule Field, 2026-11-13: at lowest priority it used 64-67 % of a processor while the
+   game and the renderer had 4.0-4.4 processors of work for the 4 cores, and the frame was bound by the CPU.)
+
+   Every BG_SLICE_NS a ticker raises the thread's poll flag, as a virtual core's kick does, and at its next loop header
+   or SVC (hos_bg_gate) the thread compares the processor time it used with the time that passed. Over its duty, it
+   rests until it is back at it, BG_REST_MAX_NS at most at a time, its virtual core given up (so a thread that never
+   blocks gets a slice in every slice and longest rest, 17 %, whatever lower duty it has). Time it spent blocked by
+   itself is rest it has had, so a thread that waits for work is never held.
+
+   A rest can fall while the thread holds one of the game's locks. A thread that has to wait for that lock (nn::os
+   mutexes: nn_os_sync.c; the SDK's own: svcArbitrateLock) ends the rest, and the holder runs unheld for BG_HURRY_NS
+   (hos_bg_hurry): the waiter waits as long as it would for a holder that runs.
+
+   HOS_BG=<name part>=<percent>,... names the threads held and their duties instead (the first match; 0 or 100: not
+   held); not set, OptimizeChange=25. HOS_OCB_NORMAL=1 leaves OptimizeChangeBank as the game made it, as before. A held
+   thread that rested has a "background:" line in the log every 10 s. 25 is a first value, not yet measured in a game:
+   a lower one gives the frame more and makes what the thread prepares (a scene change's models) arrive later. */
+#if !defined(__EMSCRIPTEN__)
+/* the processor time the calling thread has used and the time that has passed, in one unit (the host's choice) */
+static void bg_usage(int64_t *used, int64_t *wall) {
+#if defined(_WIN32)
+    /* (cycles against the time stamp counter: GetThreadTimes counts in clock ticks of 15.6 ms) */
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    *used = (int64_t)cycles, *wall = (int64_t)__builtin_ia32_rdtsc();
+#else
+    FILETIME made = {0}, left = {0}, kernel = {0}, user = {0};
+    GetThreadTimes(GetCurrentThread(), &made, &left, &kernel, &user);
+    *used = (int64_t)(((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime) * 100), *wall = hos_now_ns();
+#endif
+}
+enum { BG_SLICE_NS = 2000000, BG_REST_MAX_NS = 10000000, BG_HURRY_NS = 5000000, BG_WINDOW_NS = 50000000 };
+static volatile LONG bg_threads;   /* threads held (0: a lock's waiter looks no holder up) */
+
+/* How long a thread rests, ns, to bring `used` of `wall` (one unit; span_ns of time) down to `duty` percent: the time
+   that must still pass, at most BG_REST_MAX_NS */
+static int64_t bg_rest_ns(int64_t used, int64_t wall, int64_t span_ns, int duty) {
+    if (duty <= 0 || duty >= 100 || used <= 0 || wall <= 0 || span_ns <= 0) return 0;
+    const double missing = (double)used * 100 / duty - (double)wall;
+    if (missing <= 0) return 0;
+    const double ns = missing / (double)wall * (double)span_ns;
+    return ns > BG_REST_MAX_NS ? BG_REST_MAX_NS : (int64_t)ns;
+}
+static void bg_window(HosThread *t, int64_t now) {
+    bg_usage(&t->bg_used0, &t->bg_wall0);
+    t->bg_from = now;
+    t->bg_look = now + BG_SLICE_NS;
+}
+/* On the held thread itself, at a loop header's poll or an SVC: like hos_vcore_checkpoint, it and what it calls never
+   read or write the guest context */
+static void bg_gate(HosThread *t) {
+    int64_t now = hos_now_ns();
+    if (now < t->bg_look) return;
+    if (!t->bg_from) { bg_window(t, now); return; }
+    int64_t used, wall;
+    bg_usage(&used, &wall);
+    const int64_t rest = bg_rest_ns(used - t->bg_used0, wall - t->bg_wall0, now - t->bg_from, t->bg_duty);
+    const int hurried = now < __atomic_load_n(&t->bg_hurry_until, __ATOMIC_SEQ_CST);
+    if (hurried || rest < 1000000) {
+        /* within its duty so far: the window goes on, so that small excesses add up to a rest, and starts anew after
+           BG_WINDOW_NS, so that an idle second does not pay for a busy one after it. Time a waiter asked for is not
+           owed afterwards */
+        if (hurried || now - t->bg_from > BG_WINDOW_NS) bg_window(t, now);
+        else t->bg_look = now + BG_SLICE_NS;
+        return;
+    }
+    const int away = hos_vcore_away();
+    /* (a waiter sets the time, then looks at the flag; here the flag, then the time: one of the two sees the other) */
+    __atomic_store_n(&t->bg_resting, 1, __ATOMIC_SEQ_CST);
+    if (hos_now_ns() >= __atomic_load_n(&t->bg_hurry_until, __ATOMIC_SEQ_CST))
+        WaitForSingleObject(t->bg_wake, (DWORD)((rest + 500000) / 1000000));
+    __atomic_store_n(&t->bg_resting, 0, __ATOMIC_SEQ_CST);
+    if (away) hos_vcore_back();
+    const int64_t after = hos_now_ns();
+    t->bg_st_rested += after - now;
+    t->bg_st_rests++;
+    if (!t->bg_st_since) t->bg_st_since = now;
+    if (after - t->bg_st_since > 10000000000LL) {
+        hos_log("background: %s rested %.0f ms in %d rests, %d ended by a lock's waiter, in %.0f s (duty %d %%)", t->name,
+                t->bg_st_rested / 1e6, t->bg_st_rests, __atomic_exchange_n(&t->bg_st_hurries, 0, __ATOMIC_RELAXED),
+                (after - t->bg_st_since) / 1e9, t->bg_duty);
+        t->bg_st_since = after, t->bg_st_rested = 0, t->bg_st_rests = 0;
+    }
+    bg_window(t, after);
+}
+void hos_bg_gate(void) {
+    HosThread *t = cur;
+    if (t && t->bg_duty) bg_gate(t);
+}
+/* holding threads_lock: holder is a thread there is */
+static void bg_hurry(HosThread *holder) {
+    if (!holder->bg_duty) return;
+    __atomic_store_n(&holder->bg_hurry_until, hos_now_ns() + BG_HURRY_NS, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&holder->bg_resting, __ATOMIC_SEQ_CST)) {
+        __atomic_add_fetch(&holder->bg_st_hurries, 1, __ATOMIC_RELAXED);
+        SetEvent(holder->bg_wake);
+    }
+}
+/* The caller is about to wait for a lock held by `holder` (as read from the lock: it may have ended since, so it is
+   looked up before it is used) or by the thread with the Horizon handle `handle` (holder NULL). */
+void hos_bg_hurry(HosThread *holder, uint32_t handle) {
+    if (!bg_threads) return;
+    AcquireSRWLockShared(&threads_lock);
+    for (int i = 0; i < nthreads; i++)
+        if (holder ? threads[i] == holder : threads[i]->kernel_handle == handle) {
+            bg_hurry(threads[i]);
+            break;
+        }
+    ReleaseSRWLockShared(&threads_lock);
+}
+static DWORD WINAPI bg_ticker(void *p) {
+    (void)p;
+    for (;;) {
+        sleep_ns(BG_SLICE_NS, 0);
+        AcquireSRWLockShared(&threads_lock);
+        for (int i = 0; i < nthreads; i++) {
+            HosThread *t = threads[i];
+            if (!t->bg_duty || t->bg_resting) continue;
+            Ctx *rc = t->run_ctx;   /* (a fiber's context while it runs one) */
+            __atomic_store_n(rc ? &rc->poll : &t->ctx.poll, 1, __ATOMIC_RELAXED);
+        }
+        ReleaseSRWLockShared(&threads_lock);
+    }
+    return 0;
+}
+/* a thread got its name: whether it is one to hold, and to what */
+static void bg_classify(HosThread *t) {
+    static NameSpec specs[8];
+    static int nspecs = -1;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    static volatile LONG ticking;
+    AcquireSRWLockExclusive(&lk);
+    if (nspecs < 0) nspecs = parse_name_specs(getenv("HOS_BG"), specs, 8, 10);
+    ReleaseSRWLockExclusive(&lk);
+    const NameSpec *s = match_name_spec(specs, nspecs, t->name);
+    int duty = s ? (int)s->value : strstr(t->name, "OptimizeChange") && !env_on("HOS_OCB_NORMAL") ? 25 : 0;
+    if (duty <= 0 || duty >= 100) duty = 0;
+    if (duty && !t->bg_wake) {
+        t->bg_wake = CreateEventA(NULL, FALSE, FALSE, NULL);   /* auto-reset */
+        if (t->bg_wake) {
+            InterlockedIncrement(&bg_threads);
+            hos_log("background: %s is held to %d %% of a processor (HOS_BG=<name part>=100: not held)", t->name, duty);
+            if (!InterlockedExchange(&ticking, 1) && !CreateThread(NULL, 0, bg_ticker, NULL, 0, NULL))
+                hos_log("background: no ticker thread: held threads look at their use at SVCs only");
+        }
+    }
+    t->bg_duty = t->bg_wake ? duty : 0;
+}
+#else
+static void bg_classify(HosThread *t) { (void)t; }
+void hos_bg_gate(void) {}
+void hos_bg_hurry(HosThread *holder, uint32_t handle) { (void)holder, (void)handle; }
+#endif
 
 /* ---- nn::os threads -------------------------------------------------------------------------------------- */
 static HosThread *thread_arg(Ctx *c, uint64_t tt) {

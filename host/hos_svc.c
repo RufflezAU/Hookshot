@@ -177,6 +177,7 @@ static int spin_for_release(uint64_t mutex, uint32_t held) { (void)mutex; (void)
 static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
     HosThread *self = hos_self();
     if (spin_for_release(mutex, owner | HANDLE_WAIT_MASK)) return 0;
+    hos_bg_hurry(NULL, owner & ~HANDLE_WAIT_MASK);   /* (a background thread resting with the mutex held) */
     SvcBucket *bk = &buckets[bucket_idx(mutex)];
     AcquireSRWLockExclusive(&bk->lk);
     if (word_get(mutex) != (owner | HANDLE_WAIT_MASK)) {   /* released meanwhile: let user mode retry */
@@ -395,6 +396,7 @@ static HosThread *thread_handle(uint32_t h) { return h == CUR_THREAD ? hos_self(
 
 void a64_svc(Ctx *c, uint32_t imm) {
     hos_vcore_checkpoint();
+    hos_bg_gate();   /* (a background thread over its share rests here) */
     switch (imm) {
     case 0x01: { /* SetHeapSize(-, size) -> (result, heap address) */
         int hos_heap_size_fits(uint64_t size);   /* (hookshot, hos_mem.c: the heap stays in the guest window) */

@@ -127,6 +127,11 @@ int hos_vcores_on(void);
 int hos_vcore_away(void);
 void hos_vcore_back(void);
 void hos_vcore_checkpoint(void);
+/* background threads (hos_thread.c): a game thread held to a share of a processor looks at its use and rests
+   (hos_bg_gate: at loop-header polls and SVCs); a thread about to wait for a lock ends the holder's rest (hos_bg_hurry:
+   the holder as read from the lock, or NULL and its Horizon handle) */
+void hos_bg_gate(void);
+void hos_bg_hurry(HosThread *holder, uint32_t handle);
 /* HOS_CHAIN=<path> (hos_chain.c, diagnostic): blocks, wake-ups, sleeps and presents of the guest threads for
    scripts/chain.py's critical path. kind: a wait that blocks begins / ends, a signal that can end one, a sleep begins /
    ends, a present. lr 0: the current guest context's. */

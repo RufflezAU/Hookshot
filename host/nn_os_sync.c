@@ -470,6 +470,7 @@ static void mutex_lock(Obj *m, uint64_t guest, Ctx *c) {
     if (mutex_take(m, self)) { m->count = 1; return; }
     spin_until_free(m);
     if (mutex_take(m, self)) { m->count = 1; return; }
+    hos_bg_hurry(__atomic_load_n(&m->owner, __ATOMIC_RELAXED), 0);   /* (a background thread resting with the mutex held) */
     /* HOS_MUTEX_TRACE=<ms> (diagnostic): waits longer than that are logged with the thread that held the mutex */
     static int trace_ms = -1;
     if (trace_ms < 0) { const char *e = getenv("HOS_MUTEX_TRACE"); trace_ms = e ? atoi(e) : 0; }

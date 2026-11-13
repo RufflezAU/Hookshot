@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <linux/futex.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -149,8 +150,12 @@ void GetSystemTimeAsFileTime(FILETIME *ft) {
     ft->dwLowDateTime = (DWORD)t, ft->dwHighDateTime = (DWORD)(t >> 32);
 }
 typedef struct { HObj h; int64_t due; } HTimer;
+/* A high-resolution timer (flag 2) is waited on by the thread that makes it (hos_thread.c sleep_ns: one a thread), so
+   that thread's timer slack goes from the kernel's 50 us to 1 us: the game's idle job workers sleep 20 us at a time, and
+   with the slack each such sleep would last 70. */
 HANDLE CreateWaitableTimerExW(void *attr, LPCWSTR name, DWORD flags, DWORD access) {
-    (void)attr, (void)name, (void)flags, (void)access;
+    (void)attr, (void)name, (void)access;
+    if (flags & 2) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
     HTimer *t = (HTimer *)calloc(1, sizeof *t);
     t->h.type = H_TIMER;
     return t;

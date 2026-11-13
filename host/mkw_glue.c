@@ -698,6 +698,7 @@ void hos_gpu_queue_submit(int channel_fd, const uint64_t *entries, uint32_t n, i
 void a64_poll_cur(void) {
     void hos_vcore_checkpoint(void);
     hos_vcore_checkpoint();
+    hos_bg_gate();   /* (a background thread over its share rests here: hos_thread.c) */
 }
 void a64_poll(Ctx *c) {   /* (the old form, A64_POLL_CTX builds) */
     c->poll = 0;
